@@ -2,8 +2,18 @@ package com.videosaver.app.viewmodel
 
 import android.app.Application
 import android.content.ContentValues
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.RectF
+import android.graphics.YuvImage
+import android.graphics.BitmapFactory
+import android.graphics.ImageFormat
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
@@ -21,6 +31,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -58,6 +69,9 @@ class WatermarkViewModel(application: Application) : AndroidViewModel(applicatio
         private const val TAG = "WatermarkVM"
         private const val TIMEOUT_US = 10_000L
     }
+
+    /** Watermark region definition */
+    private data class WmRegion(val left: Int, val top: Int, val right: Int, val bottom: Int)
 
     fun onVideoSelected(uri: Uri) {
         val context = getApplication<Application>()
@@ -131,7 +145,6 @@ class WatermarkViewModel(application: Application) : AndroidViewModel(applicatio
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                // Step 1: Copy source video to a local temp file for reliable access
                 val tempDir = File(context.cacheDir, "watermark")
                 if (!tempDir.exists()) tempDir.mkdirs()
                 tempDir.listFiles()?.forEach { it.delete() }
@@ -150,7 +163,6 @@ class WatermarkViewModel(application: Application) : AndroidViewModel(applicatio
                     statusMessage = "\u062c\u0627\u0631\u064a \u062a\u062d\u0644\u064a\u0644 \u0627\u0644\u0641\u064a\u062f\u064a\u0648..."
                 )
 
-                // Step 2: Get video info
                 val retriever = MediaMetadataRetriever()
                 retriever.setDataSource(inputFile.absolutePath)
 
@@ -172,18 +184,16 @@ class WatermarkViewModel(application: Application) : AndroidViewModel(applicatio
 
                 retriever.release()
 
-                // Step 3: Process video
                 val dateFormat = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
                 val timestamp = dateFormat.format(Date())
                 val outputFileName = "NoWM_${timestamp}_${(100..999).random()}.mp4"
                 val outputFile = File(tempDir, outputFileName)
 
-                processVideoWithCodec(
+                processVideoWithImageApi(
                     inputFile, outputFile,
                     videoWidth, videoHeight, durationMs, rotation
                 )
 
-                // Clean up input temp
                 inputFile.delete()
 
                 if (isCancelled) {
@@ -207,7 +217,6 @@ class WatermarkViewModel(application: Application) : AndroidViewModel(applicatio
                     return@launch
                 }
 
-                // Step 4: Save processed video
                 handleProcessingSuccess(outputFile, outputFileName)
 
             } catch (e: Exception) {
@@ -223,10 +232,12 @@ class WatermarkViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     /**
-     * Process video: decode each frame, paint over watermark regions, re-encode.
-     * Uses native MediaCodec decode/encode pipeline.
+     * Process video using Image API for proper YUV plane handling.
+     * Decodes each frame, converts to Bitmap for watermark painting,
+     * then re-encodes. This approach is device-independent since it
+     * works with Bitmap (RGB) for modifications.
      */
-    private fun processVideoWithCodec(
+    private fun processVideoWithImageApi(
         inputFile: File,
         outputFile: File,
         width: Int,
@@ -237,7 +248,6 @@ class WatermarkViewModel(application: Application) : AndroidViewModel(applicatio
         val extractor = MediaExtractor()
         extractor.setDataSource(inputFile.absolutePath)
 
-        // Find video and audio tracks
         var videoTrackIdx = -1
         var audioTrackIdx = -1
         var videoFormat: MediaFormat? = null
@@ -270,30 +280,30 @@ class WatermarkViewModel(application: Application) : AndroidViewModel(applicatio
         } catch (_: Exception) { 8_000_000 }
 
         // Calculate watermark regions (relative to 1080x1920 TikTok base)
-        val scaleX = width / 1080.0
-        val scaleY = height / 1920.0
+        val scaleX = width.toFloat() / 1080f
+        val scaleY = height.toFloat() / 1920f
 
         val watermarkRegions = listOf(
             // TikTok logo (bottom-right)
             WmRegion(
-                (width - (180 * scaleX)).toInt().coerceAtLeast(0),
-                (height - (200 * scaleY)).toInt().coerceAtLeast(0),
-                (160 * scaleX).toInt().coerceAtLeast(50),
-                (160 * scaleY).toInt().coerceAtLeast(50)
+                (width - (200 * scaleX)).toInt().coerceAtLeast(0),
+                (height - (220 * scaleY)).toInt().coerceAtLeast(0),
+                width,
+                height
             ),
             // Username text (bottom-left)
             WmRegion(
-                (20 * scaleX).toInt(),
-                (height - (220 * scaleY)).toInt().coerceAtLeast(0),
-                (450 * scaleX).toInt().coerceAtLeast(100),
-                (80 * scaleY).toInt().coerceAtLeast(30)
+                0,
+                (height - (240 * scaleY)).toInt().coerceAtLeast(0),
+                (500 * scaleX).toInt().coerceAtMost(width),
+                (height - (140 * scaleY)).toInt().coerceAtMost(height)
             ),
-            // Small TikTok watermark text at top
+            // Small TikTok watermark text at top-left
             WmRegion(
-                (15 * scaleX).toInt(),
-                (15 * scaleY).toInt(),
-                (140 * scaleX).toInt().coerceAtLeast(40),
-                (50 * scaleY).toInt().coerceAtLeast(20)
+                0,
+                0,
+                (160 * scaleX).toInt().coerceAtMost(width),
+                (60 * scaleY).toInt().coerceAtMost(height)
             )
         )
 
@@ -302,13 +312,13 @@ class WatermarkViewModel(application: Application) : AndroidViewModel(applicatio
             statusMessage = "\u062c\u0627\u0631\u064a \u0625\u0632\u0627\u0644\u0629 \u0627\u0644\u0639\u0644\u0627\u0645\u0629 \u0627\u0644\u0645\u0627\u0626\u064a\u0629..."
         )
 
-        // Setup decoder
+        // Setup decoder in byte-buffer mode
         extractor.selectTrack(videoTrackIdx)
         val decoder = MediaCodec.createDecoderByType(videoMime)
         decoder.configure(videoFormat, null, null, 0)
         decoder.start()
 
-        // Setup encoder
+        // Setup encoder with COLOR_FormatYUV420Flexible
         val encoderFormat = MediaFormat.createVideoFormat("video/avc", width, height)
         encoderFormat.setInteger(
             MediaFormat.KEY_COLOR_FORMAT,
@@ -340,82 +350,177 @@ class WatermarkViewModel(application: Application) : AndroidViewModel(applicatio
         var inputDone = false
         var decoderDone = false
 
+        // Paint for watermark cover
+        val coverPaint = Paint().apply {
+            style = Paint.Style.FILL
+            isAntiAlias = true
+        }
+
         try {
             while (!decoderDone && !isCancelled) {
-                // Feed decoder
+                // Feed decoder from extractor
                 if (!inputDone) {
                     val inIdx = decoder.dequeueInputBuffer(TIMEOUT_US)
                     if (inIdx >= 0) {
                         val inBuf = decoder.getInputBuffer(inIdx)!!
                         val sampleSize = extractor.readSampleData(inBuf, 0)
                         if (sampleSize < 0) {
-                            decoder.queueInputBuffer(inIdx, 0, 0, 0,
-                                MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            decoder.queueInputBuffer(
+                                inIdx, 0, 0, 0,
+                                MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                            )
                             inputDone = true
                         } else {
-                            decoder.queueInputBuffer(inIdx, 0, sampleSize,
-                                extractor.sampleTime, extractor.sampleFlags)
+                            decoder.queueInputBuffer(
+                                inIdx, 0, sampleSize,
+                                extractor.sampleTime, extractor.sampleFlags
+                            )
                             extractor.advance()
                         }
                     }
                 }
 
-                // Drain decoder
+                // Drain decoder output
                 val decOutIdx = decoder.dequeueOutputBuffer(decInfo, TIMEOUT_US)
                 if (decOutIdx >= 0) {
                     val eos = (decInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
 
                     if (eos) {
                         // Signal EOS to encoder
-                        val encInIdx = encoder.dequeueInputBuffer(50_000L)
-                        if (encInIdx >= 0) {
-                            encoder.queueInputBuffer(encInIdx, 0, 0, 0,
-                                MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        var eosQueued = false
+                        for (attempt in 0..50) {
+                            val encInIdx = encoder.dequeueInputBuffer(TIMEOUT_US)
+                            if (encInIdx >= 0) {
+                                encoder.queueInputBuffer(
+                                    encInIdx, 0, 0, 0,
+                                    MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                                )
+                                eosQueued = true
+                                break
+                            }
+                            // Drain encoder to make room
+                            drainEncoderOutput(encoder, encInfo, muxer,
+                                muxerVideoTrack, muxerStarted, audioFormat).let {
+                                muxerVideoTrack = it.first
+                                muxerStarted = it.second
+                                muxerAudioTrack = it.third
+                            }
                         }
                         decoder.releaseOutputBuffer(decOutIdx, false)
                         decoderDone = true
-                    } else if (decInfo.size > 0) {
-                        val decBuf = decoder.getOutputBuffer(decOutIdx)
-                        if (decBuf != null) {
-                            val data = ByteArray(decInfo.size)
-                            decBuf.position(decInfo.offset)
-                            decBuf.get(data)
-
-                            // Apply watermark removal on YUV data
-                            blurYuvRegions(data, width, height, watermarkRegions)
-
-                            // Feed to encoder
-                            feedEncoder(encoder, data, decInfo.presentationTimeUs, encInfo,
-                                muxer, muxerVideoTrack, muxerStarted).let {
-                                muxerVideoTrack = it.first
-                                muxerStarted = it.second
-                            }
-
-                            processedFrames++
-                            val progress = ((processedFrames.toFloat() / totalFrames) * 80 + 10)
-                                .toInt().coerceIn(10, 90)
-                            _uiState.value = _uiState.value.copy(
-                                progress = progress,
-                                statusMessage = "\u062c\u0627\u0631\u064a \u0625\u0632\u0627\u0644\u0629 \u0627\u0644\u0639\u0644\u0627\u0645\u0629 \u0627\u0644\u0645\u0627\u0626\u064a\u0629... $progress%"
-                            )
+                        if (!eosQueued) {
+                            Log.w(TAG, "Could not queue EOS to encoder")
                         }
-                        decoder.releaseOutputBuffer(decOutIdx, false)
+                    } else if (decInfo.size > 0) {
+                        // Try Image API first (proper plane handling)
+                        val decImage = try {
+                            decoder.getOutputImage(decOutIdx)
+                        } catch (_: Exception) { null }
+
+                        if (decImage != null) {
+                            // Convert decoded Image (YUV) → Bitmap (RGB)
+                            val bitmap = yuvImageToBitmap(decImage, width, height)
+                            decImage.close()
+                            decoder.releaseOutputBuffer(decOutIdx, false)
+
+                            if (bitmap != null) {
+                                // Paint over watermark regions on Bitmap
+                                val mutableBmp = bitmap.copy(Bitmap.Config.ARGB_8888, true)
+                                bitmap.recycle()
+                                paintOverWatermarks(mutableBmp, watermarkRegions, coverPaint)
+
+                                // Convert Bitmap back to NV21 and feed to encoder
+                                val nv21 = bitmapToNv21(mutableBmp, width, height)
+                                mutableBmp.recycle()
+
+                                feedDataToEncoder(
+                                    encoder, nv21, decInfo.presentationTimeUs,
+                                    encInfo, muxer, muxerVideoTrack, muxerStarted, audioFormat
+                                ).let {
+                                    muxerVideoTrack = it.first
+                                    muxerStarted = it.second
+                                    muxerAudioTrack = it.third
+                                }
+                            } else {
+                                decoder.releaseOutputBuffer(decOutIdx, false)
+                            }
+                        } else {
+                            // Fallback: use raw buffer with format detection
+                            val decBuf = decoder.getOutputBuffer(decOutIdx)
+                            if (decBuf != null) {
+                                val data = ByteArray(decInfo.size)
+                                decBuf.position(decInfo.offset)
+                                decBuf.get(data)
+                                decoder.releaseOutputBuffer(decOutIdx, false)
+
+                                // Get actual output format for stride info
+                                val outFmt = decoder.outputFormat
+                                val stride = try {
+                                    outFmt.getInteger(MediaFormat.KEY_STRIDE)
+                                } catch (_: Exception) { width }
+                                val sliceHeight = try {
+                                    outFmt.getInteger(MediaFormat.KEY_SLICE_HEIGHT)
+                                } catch (_: Exception) { height }
+
+                                // Convert YUV buffer to Bitmap using YuvImage
+                                val bmp = yuvBufferToBitmap(data, stride, sliceHeight, width, height)
+                                if (bmp != null) {
+                                    val mutableBmp = bmp.copy(Bitmap.Config.ARGB_8888, true)
+                                    bmp.recycle()
+                                    paintOverWatermarks(mutableBmp, watermarkRegions, coverPaint)
+                                    val nv21 = bitmapToNv21(mutableBmp, width, height)
+                                    mutableBmp.recycle()
+
+                                    feedDataToEncoder(
+                                        encoder, nv21, decInfo.presentationTimeUs,
+                                        encInfo, muxer, muxerVideoTrack, muxerStarted, audioFormat
+                                    ).let {
+                                        muxerVideoTrack = it.first
+                                        muxerStarted = it.second
+                                        muxerAudioTrack = it.third
+                                    }
+                                } else {
+                                    // Last resort: pass through unmodified
+                                    feedDataToEncoder(
+                                        encoder, data, decInfo.presentationTimeUs,
+                                        encInfo, muxer, muxerVideoTrack, muxerStarted, audioFormat
+                                    ).let {
+                                        muxerVideoTrack = it.first
+                                        muxerStarted = it.second
+                                        muxerAudioTrack = it.third
+                                    }
+                                }
+                            } else {
+                                decoder.releaseOutputBuffer(decOutIdx, false)
+                            }
+                        }
+
+                        processedFrames++
+                        val progress = ((processedFrames.toFloat() / totalFrames) * 80 + 10)
+                            .toInt().coerceIn(10, 90)
+                        _uiState.value = _uiState.value.copy(
+                            progress = progress,
+                            statusMessage = "\u062c\u0627\u0631\u064a \u0625\u0632\u0627\u0644\u0629 \u0627\u0644\u0639\u0644\u0627\u0645\u0629 \u0627\u0644\u0645\u0627\u0626\u064a\u0629... $progress%"
+                        )
                     } else {
                         decoder.releaseOutputBuffer(decOutIdx, false)
                     }
                 }
 
-                // Drain encoder output
-                drainEncoder(encoder, encInfo, muxer, muxerVideoTrack, muxerStarted).let {
+                // Drain encoder
+                drainEncoderOutput(encoder, encInfo, muxer,
+                    muxerVideoTrack, muxerStarted, audioFormat).let {
                     muxerVideoTrack = it.first
                     muxerStarted = it.second
+                    muxerAudioTrack = it.third
                 }
             }
 
-            // Final encoder drain (including EOS)
+            // Final encoder drain
             if (!isCancelled) {
                 var encDone = false
-                while (!encDone) {
+                var drainAttempts = 0
+                while (!encDone && drainAttempts < 500) {
                     val idx = encoder.dequeueOutputBuffer(encInfo, TIMEOUT_US)
                     when {
                         idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
@@ -431,6 +536,7 @@ class WatermarkViewModel(application: Application) : AndroidViewModel(applicatio
                         idx >= 0 -> {
                             if ((encInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
                                 encoder.releaseOutputBuffer(idx, false)
+                                drainAttempts++
                                 continue
                             }
                             if ((encInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
@@ -442,35 +548,45 @@ class WatermarkViewModel(application: Application) : AndroidViewModel(applicatio
                             }
                             encoder.releaseOutputBuffer(idx, false)
                         }
-                        else -> encDone = true
+                        else -> {
+                            drainAttempts++
+                            if (drainAttempts > 100) encDone = true
+                        }
                     }
+                    drainAttempts++
                 }
             }
 
-            // Copy audio track
-            if (!isCancelled && audioTrackIdx != -1 && audioFormat != null && muxerStarted && muxerAudioTrack != -1) {
+            // Copy audio track separately
+            if (!isCancelled && audioTrackIdx != -1 && audioFormat != null && muxerStarted) {
                 _uiState.value = _uiState.value.copy(
                     progress = 92,
                     statusMessage = "\u062c\u0627\u0631\u064a \u0646\u0633\u062e \u0627\u0644\u0635\u0648\u062a..."
                 )
 
-                val audioExtractor = MediaExtractor()
-                audioExtractor.setDataSource(inputFile.absolutePath)
-                audioExtractor.selectTrack(audioTrackIdx)
+                if (muxerAudioTrack == -1) {
+                    // Audio track wasn't added yet - need to stop and restart muxer
+                    // This shouldn't happen, but handle gracefully
+                    Log.w(TAG, "Audio track not added to muxer")
+                } else {
+                    val audioExtractor = MediaExtractor()
+                    audioExtractor.setDataSource(inputFile.absolutePath)
+                    audioExtractor.selectTrack(audioTrackIdx)
 
-                val audioBuf = ByteBuffer.allocate(512 * 1024)
-                val audioInfo = MediaCodec.BufferInfo()
-                while (!isCancelled) {
-                    val size = audioExtractor.readSampleData(audioBuf, 0)
-                    if (size < 0) break
-                    audioInfo.offset = 0
-                    audioInfo.size = size
-                    audioInfo.presentationTimeUs = audioExtractor.sampleTime
-                    audioInfo.flags = audioExtractor.sampleFlags
-                    muxer.writeSampleData(muxerAudioTrack, audioBuf, audioInfo)
-                    audioExtractor.advance()
+                    val audioBuf = ByteBuffer.allocate(512 * 1024)
+                    val audioInfo = MediaCodec.BufferInfo()
+                    while (!isCancelled) {
+                        val size = audioExtractor.readSampleData(audioBuf, 0)
+                        if (size < 0) break
+                        audioInfo.offset = 0
+                        audioInfo.size = size
+                        audioInfo.presentationTimeUs = audioExtractor.sampleTime
+                        audioInfo.flags = audioExtractor.sampleFlags
+                        muxer.writeSampleData(muxerAudioTrack, audioBuf, audioInfo)
+                        audioExtractor.advance()
+                    }
+                    audioExtractor.release()
                 }
-                audioExtractor.release()
             }
 
         } finally {
@@ -484,57 +600,389 @@ class WatermarkViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    /** Watermark region definition */
-    private data class WmRegion(val x: Int, val y: Int, val w: Int, val h: Int)
+    /**
+     * Convert a decoder output Image (YUV_420_888) to Bitmap.
+     * Uses the Image API planes which properly describe the YUV layout.
+     */
+    private fun yuvImageToBitmap(image: android.media.Image, width: Int, height: Int): Bitmap? {
+        try {
+            val planes = image.planes
+            if (planes.size < 3) return null
+
+            val yPlane = planes[0]
+            val uPlane = planes[1]
+            val vPlane = planes[2]
+
+            val yBuffer = yPlane.buffer
+            val uBuffer = uPlane.buffer
+            val vBuffer = vPlane.buffer
+
+            val yRowStride = yPlane.rowStride
+            val uvRowStride = uPlane.rowStride
+            val uvPixelStride = uPlane.pixelStride
+
+            // Build NV21 byte array from Image planes
+            val nv21 = ByteArray(width * height * 3 / 2)
+
+            // Copy Y plane
+            for (row in 0 until height) {
+                yBuffer.position(row * yRowStride)
+                yBuffer.get(nv21, row * width, width)
+            }
+
+            // Copy UV planes to NV21 interleaved format (V then U)
+            val uvHeight = height / 2
+            val uvWidth = width / 2
+            val uvOffset = width * height
+            for (row in 0 until uvHeight) {
+                for (col in 0 until uvWidth) {
+                    val uvIndex = row * uvRowStride + col * uvPixelStride
+                    vBuffer.position(uvIndex)
+                    uBuffer.position(uvIndex)
+                    nv21[uvOffset + row * width + col * 2] = vBuffer.get()
+                    nv21[uvOffset + row * width + col * 2 + 1] = uBuffer.get()
+                }
+            }
+
+            // Use YuvImage to convert to JPEG then to Bitmap
+            val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+            val out = ByteArrayOutputStream()
+            yuvImage.compressToJpeg(Rect(0, 0, width, height), 95, out)
+            val jpegBytes = out.toByteArray()
+            return BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+        } catch (e: Exception) {
+            Log.e(TAG, "yuvImageToBitmap failed", e)
+            return null
+        }
+    }
 
     /**
-     * Feed a processed frame to the encoder, draining output as needed.
+     * Convert raw YUV buffer to Bitmap using YuvImage.
+     * Handles stride/sliceHeight differences.
      */
-    private fun feedEncoder(
+    private fun yuvBufferToBitmap(
+        data: ByteArray, stride: Int, sliceHeight: Int,
+        width: Int, height: Int
+    ): Bitmap? {
+        try {
+            // If stride matches width, data is likely already NV21-compatible
+            val nv21: ByteArray
+            if (stride == width && sliceHeight == height) {
+                nv21 = data
+            } else {
+                // Extract actual image data removing stride padding
+                nv21 = ByteArray(width * height * 3 / 2)
+                // Copy Y plane (removing stride padding)
+                for (row in 0 until height) {
+                    val srcOffset = row * stride
+                    val dstOffset = row * width
+                    if (srcOffset + width <= data.size && dstOffset + width <= nv21.size) {
+                        System.arraycopy(data, srcOffset, nv21, dstOffset, width)
+                    }
+                }
+                // Copy UV plane
+                val srcUvOffset = stride * sliceHeight
+                val dstUvOffset = width * height
+                val uvHeight = height / 2
+                for (row in 0 until uvHeight) {
+                    val srcOff = srcUvOffset + row * stride
+                    val dstOff = dstUvOffset + row * width
+                    if (srcOff + width <= data.size && dstOff + width <= nv21.size) {
+                        System.arraycopy(data, srcOff, nv21, dstOff, width)
+                    }
+                }
+            }
+
+            val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+            val out = ByteArrayOutputStream()
+            yuvImage.compressToJpeg(Rect(0, 0, width, height), 95, out)
+            val jpegBytes = out.toByteArray()
+            return BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
+        } catch (e: Exception) {
+            Log.e(TAG, "yuvBufferToBitmap failed", e)
+            return null
+        }
+    }
+
+    /**
+     * Paint over watermark regions on a Bitmap.
+     * Samples the surrounding border color and fills with a smooth gradient.
+     */
+    private fun paintOverWatermarks(bitmap: Bitmap, regions: List<WmRegion>, paint: Paint) {
+        val canvas = Canvas(bitmap)
+        val w = bitmap.width
+        val h = bitmap.height
+
+        for (region in regions) {
+            val left = region.left.coerceIn(0, w - 1)
+            val top = region.top.coerceIn(0, h - 1)
+            val right = region.right.coerceIn(left + 1, w)
+            val bottom = region.bottom.coerceIn(top + 1, h)
+
+            if (right - left < 2 || bottom - top < 2) continue
+
+            // Sample average color from the border pixels around the watermark region
+            val avgColor = sampleBorderColor(bitmap, left, top, right, bottom)
+            paint.color = avgColor
+
+            // Draw filled rectangle over watermark
+            canvas.drawRect(
+                left.toFloat(), top.toFloat(),
+                right.toFloat(), bottom.toFloat(),
+                paint
+            )
+
+            // Apply simple edge blending for smoother transition
+            val blendPaint = Paint().apply {
+                style = Paint.Style.STROKE
+                strokeWidth = 3f
+                color = avgColor
+                alpha = 180
+                isAntiAlias = true
+            }
+            canvas.drawRect(
+                (left - 1).coerceAtLeast(0).toFloat(),
+                (top - 1).coerceAtLeast(0).toFloat(),
+                (right + 1).coerceAtMost(w).toFloat(),
+                (bottom + 1).coerceAtMost(h).toFloat(),
+                blendPaint
+            )
+        }
+    }
+
+    /**
+     * Sample the average color from pixels around the border of a rectangle.
+     */
+    private fun sampleBorderColor(
+        bitmap: Bitmap, left: Int, top: Int, right: Int, bottom: Int
+    ): Int {
+        var rSum = 0L
+        var gSum = 0L
+        var bSum = 0L
+        var count = 0
+
+        val w = bitmap.width
+        val h = bitmap.height
+
+        // Sample pixels along the border (1px outside the region)
+        // Top edge
+        val sampleTop = (top - 2).coerceAtLeast(0)
+        if (sampleTop >= 0 && sampleTop < h) {
+            for (x in left until right step 2) {
+                if (x in 0 until w) {
+                    val pixel = bitmap.getPixel(x, sampleTop)
+                    rSum += Color.red(pixel)
+                    gSum += Color.green(pixel)
+                    bSum += Color.blue(pixel)
+                    count++
+                }
+            }
+        }
+
+        // Bottom edge
+        val sampleBottom = (bottom + 1).coerceAtMost(h - 1)
+        if (sampleBottom >= 0 && sampleBottom < h) {
+            for (x in left until right step 2) {
+                if (x in 0 until w) {
+                    val pixel = bitmap.getPixel(x, sampleBottom)
+                    rSum += Color.red(pixel)
+                    gSum += Color.green(pixel)
+                    bSum += Color.blue(pixel)
+                    count++
+                }
+            }
+        }
+
+        // Left edge
+        val sampleLeft = (left - 2).coerceAtLeast(0)
+        if (sampleLeft >= 0 && sampleLeft < w) {
+            for (y in top until bottom step 2) {
+                if (y in 0 until h) {
+                    val pixel = bitmap.getPixel(sampleLeft, y)
+                    rSum += Color.red(pixel)
+                    gSum += Color.green(pixel)
+                    bSum += Color.blue(pixel)
+                    count++
+                }
+            }
+        }
+
+        // Right edge
+        val sampleRight = (right + 1).coerceAtMost(w - 1)
+        if (sampleRight >= 0 && sampleRight < w) {
+            for (y in top until bottom step 2) {
+                if (y in 0 until h) {
+                    val pixel = bitmap.getPixel(sampleRight, y)
+                    rSum += Color.red(pixel)
+                    gSum += Color.green(pixel)
+                    bSum += Color.blue(pixel)
+                    count++
+                }
+            }
+        }
+
+        return if (count > 0) {
+            Color.rgb(
+                (rSum / count).toInt().coerceIn(0, 255),
+                (gSum / count).toInt().coerceIn(0, 255),
+                (bSum / count).toInt().coerceIn(0, 255)
+            )
+        } else {
+            Color.BLACK
+        }
+    }
+
+    /**
+     * Convert ARGB Bitmap to NV21 byte array for encoder input.
+     */
+    private fun bitmapToNv21(bitmap: Bitmap, width: Int, height: Int): ByteArray {
+        val argb = IntArray(width * height)
+        bitmap.getPixels(argb, 0, width, 0, 0, width, height)
+
+        val nv21 = ByteArray(width * height * 3 / 2)
+        val uvOffset = width * height
+
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                val pixel = argb[y * width + x]
+                val r = Color.red(pixel)
+                val g = Color.green(pixel)
+                val b = Color.blue(pixel)
+
+                // RGB to YUV conversion (BT.601)
+                val yVal = ((66 * r + 129 * g + 25 * b + 128) shr 8) + 16
+                nv21[y * width + x] = yVal.coerceIn(0, 255).toByte()
+
+                // UV subsampled (every 2x2 block)
+                if (y % 2 == 0 && x % 2 == 0) {
+                    val uvY = y / 2
+                    val uvX = x / 2
+                    val vVal = ((112 * r - 94 * g - 18 * b + 128) shr 8) + 128
+                    val uVal = ((-38 * r - 74 * g + 112 * b + 128) shr 8) + 128
+                    val uvIdx = uvOffset + uvY * width + uvX * 2
+                    if (uvIdx + 1 < nv21.size) {
+                        nv21[uvIdx] = vVal.coerceIn(0, 255).toByte()
+                        nv21[uvIdx + 1] = uVal.coerceIn(0, 255).toByte()
+                    }
+                }
+            }
+        }
+
+        return nv21
+    }
+
+    /**
+     * Feed YUV data to encoder input, draining output as needed.
+     */
+    private fun feedDataToEncoder(
         encoder: MediaCodec,
         data: ByteArray,
         pts: Long,
         encInfo: MediaCodec.BufferInfo,
         muxer: MediaMuxer,
         videoTrack: Int,
-        muxerStarted: Boolean
-    ): Pair<Int, Boolean> {
+        muxerStarted: Boolean,
+        audioFormat: MediaFormat?
+    ): Triple<Int, Boolean, Int> {
         var vt = videoTrack
         var ms = muxerStarted
+        var at = -1
 
         var attempts = 0
-        while (!isCancelled && attempts < 100) {
+        while (!isCancelled && attempts < 200) {
             val encInIdx = encoder.dequeueInputBuffer(TIMEOUT_US)
             if (encInIdx >= 0) {
-                val encBuf = encoder.getInputBuffer(encInIdx)!!
-                encBuf.clear()
-                val size = data.size.coerceAtMost(encBuf.capacity())
-                encBuf.put(data, 0, size)
-                encoder.queueInputBuffer(encInIdx, 0, size, pts, 0)
+                // Try using Image API for encoder input
+                val encImage = try {
+                    encoder.getInputImage(encInIdx)
+                } catch (_: Exception) { null }
+
+                if (encImage != null) {
+                    // Fill encoder Image planes from our NV21 data
+                    fillEncoderImage(encImage, data, encImage.width, encImage.height)
+                    encImage.close()
+                    encoder.queueInputBuffer(encInIdx, 0, 0, pts, 0)
+                } else {
+                    // Fallback: direct buffer copy
+                    val encBuf = encoder.getInputBuffer(encInIdx)!!
+                    encBuf.clear()
+                    val size = data.size.coerceAtMost(encBuf.capacity())
+                    encBuf.put(data, 0, size)
+                    encoder.queueInputBuffer(encInIdx, 0, size, pts, 0)
+                }
                 break
             }
-            drainEncoder(encoder, encInfo, muxer, vt, ms).let {
+            // Drain encoder to make room
+            drainEncoderOutput(encoder, encInfo, muxer, vt, ms, audioFormat).let {
                 vt = it.first
                 ms = it.second
+                at = it.third
             }
             attempts++
         }
 
-        return Pair(vt, ms)
+        return Triple(vt, ms, at)
+    }
+
+    /**
+     * Fill encoder input Image planes from NV21 data.
+     */
+    private fun fillEncoderImage(image: android.media.Image, nv21: ByteArray, width: Int, height: Int) {
+        val planes = image.planes
+        if (planes.size < 3) return
+
+        val yPlane = planes[0]
+        val uPlane = planes[1]
+        val vPlane = planes[2]
+
+        val yBuffer = yPlane.buffer
+        val uBuffer = uPlane.buffer
+        val vBuffer = vPlane.buffer
+
+        val yRowStride = yPlane.rowStride
+        val uvRowStride = uPlane.rowStride
+        val uvPixelStride = uPlane.pixelStride
+
+        // Fill Y plane
+        for (row in 0 until height) {
+            yBuffer.position(row * yRowStride)
+            yBuffer.put(nv21, row * width, width)
+        }
+
+        // Fill UV planes from NV21 interleaved data
+        val uvOffset = width * height
+        val uvHeight = height / 2
+        val uvWidth = width / 2
+
+        for (row in 0 until uvHeight) {
+            for (col in 0 until uvWidth) {
+                val nv21Idx = uvOffset + row * width + col * 2
+                val vVal = nv21[nv21Idx]
+                val uVal = nv21[nv21Idx + 1]
+
+                val planeIdx = row * uvRowStride + col * uvPixelStride
+                vBuffer.position(planeIdx)
+                vBuffer.put(vVal)
+                uBuffer.position(planeIdx)
+                uBuffer.put(uVal)
+            }
+        }
     }
 
     /**
      * Drain encoder output buffers and write to muxer.
      */
-    private fun drainEncoder(
+    private fun drainEncoderOutput(
         encoder: MediaCodec,
         bufferInfo: MediaCodec.BufferInfo,
         muxer: MediaMuxer,
         currentVideoTrack: Int,
-        currentMuxerStarted: Boolean
-    ): Pair<Int, Boolean> {
+        currentMuxerStarted: Boolean,
+        audioFormat: MediaFormat?
+    ): Triple<Int, Boolean, Int> {
         var videoTrack = currentVideoTrack
         var muxerStarted = currentMuxerStarted
+        var audioTrack = -1
 
         while (true) {
             val idx = encoder.dequeueOutputBuffer(bufferInfo, 0)
@@ -542,8 +990,12 @@ class WatermarkViewModel(application: Application) : AndroidViewModel(applicatio
                 idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                     if (!muxerStarted) {
                         videoTrack = muxer.addTrack(encoder.outputFormat)
+                        if (audioFormat != null) {
+                            audioTrack = muxer.addTrack(audioFormat)
+                        }
                         muxer.start()
                         muxerStarted = true
+                        Log.d(TAG, "Muxer started: videoTrack=$videoTrack audioTrack=$audioTrack")
                     }
                 }
                 idx >= 0 -> {
@@ -561,93 +1013,7 @@ class WatermarkViewModel(application: Application) : AndroidViewModel(applicatio
             }
         }
 
-        return Pair(videoTrack, muxerStarted)
-    }
-
-    /**
-     * Blur/smooth watermark regions in YUV420 frame data.
-     * Replaces the watermark area with a smooth gradient from surrounding pixels.
-     */
-    private fun blurYuvRegions(
-        frameData: ByteArray,
-        width: Int,
-        height: Int,
-        regions: List<WmRegion>
-    ) {
-        val yPlaneSize = width * height
-
-        for (region in regions) {
-            val rx = region.x.coerceIn(0, width - 1)
-            val ry = region.y.coerceIn(0, height - 1)
-            val rw = region.w.coerceAtMost(width - rx)
-            val rh = region.h.coerceAtMost(height - ry)
-            if (rw <= 0 || rh <= 0) continue
-
-            // Sample border pixels for smooth fill
-            val topAvg = sampleRowAvgY(frameData, width, height, (ry - 1).coerceAtLeast(0), rx, rw)
-            val botAvg = sampleRowAvgY(frameData, width, height, (ry + rh).coerceAtMost(height - 1), rx, rw)
-            val leftAvg = sampleColAvgY(frameData, width, height, (rx - 1).coerceAtLeast(0), ry, rh)
-            val rightAvg = sampleColAvgY(frameData, width, height, (rx + rw).coerceAtMost(width - 1), ry, rh)
-
-            // Fill Y plane with bilinear interpolation from borders
-            for (row in 0 until rh) {
-                val ty = row.toFloat() / rh.coerceAtLeast(1)
-                for (col in 0 until rw) {
-                    val tx = col.toFloat() / rw.coerceAtLeast(1)
-                    val topBlend = topAvg * (1 - ty) + botAvg * ty
-                    val leftBlend = leftAvg * (1 - tx) + rightAvg * tx
-                    val blended = ((topBlend + leftBlend) / 2).toInt().coerceIn(0, 255)
-                    val idx = (ry + row) * width + (rx + col)
-                    if (idx < yPlaneSize) {
-                        frameData[idx] = blended.toByte()
-                    }
-                }
-            }
-
-            // Fill UV plane (NV12/NV21 - interleaved U/V at half resolution)
-            val uvBaseY = ry / 2
-            val uvH = rh / 2
-            val uvBaseX = rx / 2
-            val uvW = rw / 2
-
-            for (row in 0 until uvH) {
-                for (col in 0 until uvW) {
-                    val uvIdx = yPlaneSize + (uvBaseY + row) * width + (uvBaseX + col) * 2
-                    if (uvIdx + 1 < frameData.size) {
-                        frameData[uvIdx] = 128.toByte()
-                        frameData[uvIdx + 1] = 128.toByte()
-                    }
-                }
-            }
-        }
-    }
-
-    private fun sampleRowAvgY(data: ByteArray, w: Int, h: Int, row: Int, startX: Int, len: Int): Float {
-        if (row < 0 || row >= h) return 128f
-        var sum = 0L
-        var count = 0
-        for (col in startX until (startX + len).coerceAtMost(w)) {
-            val idx = row * w + col
-            if (idx < w * h) {
-                sum += (data[idx].toInt() and 0xFF)
-                count++
-            }
-        }
-        return if (count > 0) sum.toFloat() / count else 128f
-    }
-
-    private fun sampleColAvgY(data: ByteArray, w: Int, h: Int, col: Int, startY: Int, len: Int): Float {
-        if (col < 0 || col >= w) return 128f
-        var sum = 0L
-        var count = 0
-        for (row in startY until (startY + len).coerceAtMost(h)) {
-            val idx = row * w + col
-            if (idx < w * h) {
-                sum += (data[idx].toInt() and 0xFF)
-                count++
-            }
-        }
-        return if (count > 0) sum.toFloat() / count else 128f
+        return Triple(videoTrack, muxerStarted, audioTrack)
     }
 
     private fun handleProcessingSuccess(outputFile: File, outputFileName: String) {
@@ -659,16 +1025,13 @@ class WatermarkViewModel(application: Application) : AndroidViewModel(applicatio
         )
 
         try {
-            // Save local copy for sharing
             val shareDir = File(context.getExternalFilesDir(null), "videos")
             if (!shareDir.exists()) shareDir.mkdirs()
             shareDir.listFiles()?.forEach { it.delete() }
             val shareFile = File(shareDir, outputFileName)
             outputFile.copyTo(shareFile, overwrite = true)
 
-            // Save to gallery
             val savedPath = saveToGallery(outputFileName, outputFile)
-
             outputFile.delete()
 
             if (savedPath != null) {
