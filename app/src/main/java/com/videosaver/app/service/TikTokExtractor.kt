@@ -230,37 +230,66 @@ class TikTokExtractor : VideoExtractor {
                 return Pair(null, true)
             }
 
-            // Prefer HD, then no-watermark play, then watermark play
-            var videoUrl = data.optString("hdplay", "").ifEmpty {
-                data.optString("play", "").ifEmpty {
-                    data.optString("wmplay", "")
+            // Collect all available video URLs to try (CDN may serve images in some regions)
+            val candidateUrls = mutableListOf<String>()
+            // Try play first (standard quality, most reliable across regions)
+            data.optString("play", "").let { if (it.isNotEmpty()) candidateUrls.add(it) }
+            // Then HD
+            data.optString("hdplay", "").let { if (it.isNotEmpty()) candidateUrls.add(it) }
+            // Then watermarked as last resort
+            data.optString("wmplay", "").let { if (it.isNotEmpty()) candidateUrls.add(it) }
+
+            if (candidateUrls.isEmpty()) return Pair(null, false)
+
+            // Ensure full URLs
+            val fullUrls = candidateUrls.map { u ->
+                if (!u.startsWith("http")) "https://www.tikwm.com$u" else u
+            }
+
+            // Try each URL and verify it returns actual video bytes (not JPEG/image)
+            var videoUrl = ""
+            for (candidateUrl in fullUrls) {
+                try {
+                    val verifyRequest = Request.Builder()
+                        .url(candidateUrl)
+                        .header("User-Agent", mobileUserAgent)
+                        .header("Range", "bytes=0-1023")
+                        .build()
+
+                    val verifyResponse = client.newCall(verifyRequest).execute()
+                    val verifyCode = verifyResponse.code
+                    val verifyContentType = verifyResponse.header("Content-Type", "") ?: ""
+
+                    // Read actual bytes to check for image headers
+                    val headerBytes = verifyResponse.body?.bytes()?.take(8) ?: emptyList()
+                    verifyResponse.close()
+
+                    // Skip if HTTP error
+                    if (verifyCode !in 200..299 && verifyCode != 206) continue
+                    // Skip HTML/text responses
+                    if (verifyContentType.contains("text/html") || verifyContentType.contains("text/plain")) continue
+                    // Skip audio-only responses
+                    if (verifyContentType.contains("audio/mpeg") || verifyContentType.contains("audio/mp3")) continue
+                    // Skip image responses (Content-Type check)
+                    if (verifyContentType.contains("image/")) continue
+
+                    // Skip if actual bytes are JPEG (FFD8FF) or PNG (89504E47) or GIF (474946)
+                    if (headerBytes.size >= 3) {
+                        val isJpeg = headerBytes[0] == 0xFF.toByte() && headerBytes[1] == 0xD8.toByte() && headerBytes[2] == 0xFF.toByte()
+                        val isPng = headerBytes.size >= 4 && headerBytes[0] == 0x89.toByte() && headerBytes[1] == 0x50.toByte() && headerBytes[2] == 0x4E.toByte() && headerBytes[3] == 0x47.toByte()
+                        val isGif = headerBytes[0] == 0x47.toByte() && headerBytes[1] == 0x49.toByte() && headerBytes[2] == 0x46.toByte()
+                        if (isJpeg || isPng || isGif) continue
+                    }
+
+                    // This URL returns valid video content
+                    videoUrl = candidateUrl
+                    break
+                } catch (_: Exception) {
+                    continue
                 }
             }
 
             if (videoUrl.isEmpty()) return Pair(null, false)
-
-            // Ensure full URL (tikwm sometimes returns relative paths)
-            if (!videoUrl.startsWith("http")) {
-                videoUrl = "https://www.tikwm.com$videoUrl"
-            }
-
-            // Verify the video URL is actually downloadable
-            val verifyRequest = Request.Builder()
-                .url(videoUrl)
-                .header("User-Agent", mobileUserAgent)
-                .header("Range", "bytes=0-1023")
-                .build()
-
-            val verifyResponse = client.newCall(verifyRequest).execute()
-            val verifyCode = verifyResponse.code
-            val verifyContentType = verifyResponse.header("Content-Type", "") ?: ""
-            verifyResponse.close()
-
-            // If verification fails or returns HTML/text, skip
-            if (verifyCode !in 200..299 && verifyCode != 206) return Pair(null, false)
-            if (verifyContentType.contains("text/html") || verifyContentType.contains("text/plain")) return Pair(null, false)
-            // Reject audio-only responses (tikwm sometimes returns music URL as video)
-            if (verifyContentType.contains("audio/mpeg") || verifyContentType.contains("audio/mp3")) return Pair(null, false)
 
             val thumbnailUrl = data.optString("cover", "").ifEmpty {
                 data.optString("origin_cover", "")

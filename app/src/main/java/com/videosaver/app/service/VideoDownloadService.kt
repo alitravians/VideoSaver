@@ -165,9 +165,10 @@ class VideoDownloadService : Service() {
                 }
 
                 val contentType = response.header("Content-Type", "") ?: ""
-                // Reject non-video responses (error pages, text errors, JSON errors, audio-only)
+                // Reject non-video responses (error pages, text errors, JSON errors, audio-only, images)
                 if (contentType.contains("text/") || contentType.contains("application/json") ||
-                    contentType.contains("audio/mpeg") || contentType.contains("audio/mp3")) {
+                    contentType.contains("audio/mpeg") || contentType.contains("audio/mp3") ||
+                    contentType.contains("image/")) {
                     body.close()
                     repository.updateError(downloadId, "الخادم لم يرجع ملف فيديو صالح")
                     stopSelf()
@@ -230,58 +231,64 @@ class VideoDownloadService : Service() {
                     return@launch
                 }
 
-                // Check file header to reject obviously non-video content (HTML error pages, etc.)
-                val isLikelyVideo = try {
+                // Check file header to reject non-video content (images, HTML, etc.)
+                val headerBytes = try {
                     tempFile.inputStream().use { input ->
-                        val header = ByteArray(12)
-                        val read = input.read(header)
-                        if (read < 8) false
-                        else {
-                            // Standard MP4: bytes 4-7 = "ftyp"
-                            (header[4] == 0x66.toByte() && header[5] == 0x74.toByte() &&
-                             header[6] == 0x79.toByte() && header[7] == 0x70.toByte()) ||
-                            // MP4 moov or mdat atoms
-                            (header[4] == 0x6D.toByte() && header[5] == 0x6F.toByte()) ||
-                            (header[4] == 0x6D.toByte() && header[5] == 0x64.toByte()) ||
-                            // WebM: starts with 0x1A45DFA3
-                            (header[0] == 0x1A.toByte() && header[1] == 0x45.toByte()) ||
-                            // ID3 metadata header (TikTok wraps MP4 with ID3 tags): "ID3"
-                            (header[0] == 0x49.toByte() && header[1] == 0x44.toByte() && header[2] == 0x33.toByte()) ||
-                            // MPEG-TS: starts with 0x47 sync byte (exclude GIF which starts with "GI" = 0x47 0x49)
-                            (header[0] == 0x47.toByte() && header[1] != 0x49.toByte()) ||
-                            // FLV: starts with "FLV"
-                            (header[0] == 0x46.toByte() && header[1] == 0x4C.toByte() && header[2] == 0x56.toByte()) ||
-                            // If file is large enough (>100KB), trust it even if header is unknown
-                            // (some CDNs prepend custom headers)
-                            tempFile.length() > 100 * 1024
-                        }
+                        val h = ByteArray(12)
+                        input.read(h)
+                        h
                     }
-                } catch (_: Exception) { false }
+                } catch (_: Exception) { ByteArray(12) }
 
-                // Only reject if it looks like an HTML error page or text response
+                val headerHex = headerBytes.joinToString("") { "%02x".format(it) }
+
+                // First: explicitly reject image files (JPEG, PNG, GIF, WebP)
+                val isImage = headerBytes.size >= 3 && (
+                    // JPEG: FFD8FF
+                    (headerBytes[0] == 0xFF.toByte() && headerBytes[1] == 0xD8.toByte() && headerBytes[2] == 0xFF.toByte()) ||
+                    // PNG: 89504E47
+                    (headerBytes[0] == 0x89.toByte() && headerBytes[1] == 0x50.toByte() && headerBytes[2] == 0x4E.toByte() && headerBytes[3] == 0x47.toByte()) ||
+                    // GIF: 474946
+                    (headerBytes[0] == 0x47.toByte() && headerBytes[1] == 0x49.toByte() && headerBytes[2] == 0x46.toByte()) ||
+                    // WebP: 52494646...57454250
+                    (headerBytes.size >= 12 && headerBytes[0] == 0x52.toByte() && headerBytes[1] == 0x49.toByte() && headerBytes[8] == 0x57.toByte() && headerBytes[9] == 0x45.toByte())
+                )
+
+                if (isImage) {
+                    tempFile.delete()
+                    repository.updateError(downloadId, "الخادم رجع صورة بدل فيديو - حاول مرة أخرى (header: $headerHex)")
+                    stopSelf()
+                    return@launch
+                }
+
+                // Then: check for valid video headers
+                val isLikelyVideo = headerBytes.size >= 8 && (
+                    // Standard MP4: bytes 4-7 = "ftyp"
+                    (headerBytes[4] == 0x66.toByte() && headerBytes[5] == 0x74.toByte() &&
+                     headerBytes[6] == 0x79.toByte() && headerBytes[7] == 0x70.toByte()) ||
+                    // MP4 moov or mdat atoms
+                    (headerBytes[4] == 0x6D.toByte() && headerBytes[5] == 0x6F.toByte()) ||
+                    (headerBytes[4] == 0x6D.toByte() && headerBytes[5] == 0x64.toByte()) ||
+                    // WebM: starts with 0x1A45DFA3
+                    (headerBytes[0] == 0x1A.toByte() && headerBytes[1] == 0x45.toByte()) ||
+                    // ID3 metadata header (TikTok wraps MP4 with ID3 tags): "ID3"
+                    (headerBytes[0] == 0x49.toByte() && headerBytes[1] == 0x44.toByte() && headerBytes[2] == 0x33.toByte()) ||
+                    // MPEG-TS: starts with 0x47 sync byte (exclude GIF)
+                    (headerBytes[0] == 0x47.toByte() && headerBytes[1] != 0x49.toByte()) ||
+                    // FLV: starts with "FLV"
+                    (headerBytes[0] == 0x46.toByte() && headerBytes[1] == 0x4C.toByte() && headerBytes[2] == 0x56.toByte()) ||
+                    // Large files with unknown headers - trust them
+                    tempFile.length() > 100 * 1024
+                )
+
                 if (!isLikelyVideo) {
-                    val firstBytes = try {
-                        tempFile.inputStream().use { stream ->
-                            val bytes = ByteArray(16)
-                            stream.read(bytes)
-                            bytes.joinToString("") { b -> "%02x".format(b) }
-                        }
-                    } catch (_: Exception) { "unknown" }
-                    // Check if it's HTML/text (starts with '<' or '{')
-                    val isTextContent = try {
-                        tempFile.inputStream().use { stream ->
-                            val first = stream.read()
-                            first == '<'.code || first == '{'.code || first == 'H'.code
-                        }
-                    } catch (_: Exception) { false }
-
+                    val isTextContent = headerBytes[0] == '<'.code.toByte() || headerBytes[0] == '{'.code.toByte() || headerBytes[0] == 'H'.code.toByte()
                     if (isTextContent || tempFile.length() < 10 * 1024) {
                         tempFile.delete()
-                        repository.updateError(downloadId, "الملف ليس فيديو صالح (magic: $firstBytes)")
+                        repository.updateError(downloadId, "الملف ليس فيديو صالح (header: $headerHex)")
                         stopSelf()
                         return@launch
                     }
-                    // If not text and file is reasonably large, proceed anyway
                 }
 
                 // Read temp file header for verification later
