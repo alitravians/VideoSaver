@@ -28,6 +28,9 @@ class TikTokExtractor : VideoExtractor {
     private val desktopUserAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
+    // Backup watermarked URL - used only if cobalt and other sources fail
+    private var lastWatermarkedBackup: VideoInfo? = null
+
     // Cobalt v7 instances (no auth required, use /api/json endpoint)
     private val cobaltInstances = listOf(
         "https://downloadapi.stuff.solutions/api/json"
@@ -38,15 +41,25 @@ class TikTokExtractor : VideoExtractor {
             // Clean URL first
             val cleanedUrl = cleanTikTokUrl(url)
 
-            // Step 1: Try cobalt API + verify stream URL actually works
-            var videoInfo = tryCobaltApiWithVerification(cleanedUrl)
+            // Reset watermarked backup
+            lastWatermarkedBackup = null
 
-            // Step 2: If cobalt failed, try tikwm.com API (reliable, returns working CDN URLs)
+            // Step 1: Try tikwm.com API FIRST (most reliable, returns thumbnails + working CDN URLs)
+            // If tikwm only has watermarked URL, it saves to lastWatermarkedBackup and returns null
+            val (tikwmResult, isSlideshow) = tryTikWmApi(cleanedUrl)
+            var videoInfo = tikwmResult
+
+            // Step 2: If tikwm didn't return no-watermark, try ssstik.io (proxied, always no-watermark)
             if (videoInfo == null) {
-                videoInfo = tryTikWmApi(cleanedUrl)
+                videoInfo = trySsstikApi(cleanedUrl)
             }
 
-            // Step 3: If tikwm failed, try scraping fallbacks
+            // Step 3: Try cobalt API (always no-watermark)
+            if (videoInfo == null) {
+                videoInfo = tryCobaltApiWithVerification(cleanedUrl)
+            }
+
+            // Step 4: If all no-watermark sources failed, try scraping fallbacks
             if (videoInfo == null) {
                 val resolvedUrl = resolveShortUrl(cleanedUrl)
                 videoInfo = tryOEmbedMethod(resolvedUrl)
@@ -54,11 +67,25 @@ class TikTokExtractor : VideoExtractor {
                     ?: tryApiMethod(resolvedUrl)
             }
 
+            // Step 5: Last resort - use tikwm watermarked URL if everything else failed
+            if (videoInfo == null && lastWatermarkedBackup != null) {
+                videoInfo = lastWatermarkedBackup
+            }
+
+            // Step 6: If we have video but no thumbnail, try to fetch thumbnail separately
+            if (videoInfo != null && videoInfo.thumbnailUrl.isEmpty()) {
+                val thumbnail = tryGetThumbnail(cleanedUrl)
+                if (thumbnail.isNotEmpty()) {
+                    videoInfo = videoInfo.copy(thumbnailUrl = thumbnail)
+                }
+            }
+
             if (videoInfo != null) {
                 Result.success(videoInfo)
+            } else if (isSlideshow) {
+                Result.failure(Exception("هذا المنشور عبارة عن صور وليس فيديو - لا يمكن تحميله كفيديو"))
             } else {
-                Result.failure(Exception("تعذر استخراج الفيديو من TikTok. تأكد أن الرابط صحيح."))
-            }
+                Result.failure(Exception("تعذر استخراج الفيديو من TikTok. تأكد أن الرابط صحيح."))            }
         } catch (e: Exception) {
             Result.failure(Exception("خطأ في الاتصال: ${e.message}"))
         }
@@ -180,12 +207,115 @@ class TikTokExtractor : VideoExtractor {
     }
 
     /**
-     * Try tikwm.com API - reliable free TikTok video extraction.
-     * Returns direct TikTok CDN URLs that work for downloading.
+     * Verify a video URL returns actual video bytes (not JPEG/image/HTML).
      */
-    private fun tryTikWmApi(url: String): VideoInfo? {
+    private fun verifyVideoUrl(url: String): Boolean {
         return try {
-            val requestBody = "url=$url&hd=1"
+            val request = Request.Builder()
+                .url(url)
+                .header("User-Agent", mobileUserAgent)
+                .header("Range", "bytes=0-1023")
+                .build()
+
+            val response = client.newCall(request).execute()
+            val code = response.code
+            val contentType = response.header("Content-Type", "") ?: ""
+            val headerBytes = response.body?.bytes()?.take(8) ?: emptyList()
+            response.close()
+
+            // Fail if HTTP error
+            if (code !in 200..299 && code != 206) return false
+            // Fail if HTML/text
+            if (contentType.contains("text/html") || contentType.contains("text/plain")) return false
+            // Fail if audio-only
+            if (contentType.contains("audio/mpeg") || contentType.contains("audio/mp3")) return false
+            // Fail if image Content-Type
+            if (contentType.contains("image/")) return false
+
+            // Fail if actual bytes are JPEG/PNG/GIF
+            if (headerBytes.size >= 3) {
+                val isJpeg = headerBytes[0] == 0xFF.toByte() && headerBytes[1] == 0xD8.toByte() && headerBytes[2] == 0xFF.toByte()
+                val isPng = headerBytes.size >= 4 && headerBytes[0] == 0x89.toByte() && headerBytes[1] == 0x50.toByte() && headerBytes[2] == 0x4E.toByte() && headerBytes[3] == 0x47.toByte()
+                val isGif = headerBytes[0] == 0x47.toByte() && headerBytes[1] == 0x49.toByte() && headerBytes[2] == 0x46.toByte()
+                if (isJpeg || isPng || isGif) return false
+            }
+
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Try ssstik.io API - downloads through tikcdn.io proxy (bypasses CDN region issues).
+     * Always returns no-watermark video.
+     */
+    private fun trySsstikApi(url: String): VideoInfo? {
+        return try {
+            // POST to ssstik API to get download links
+            val requestBody = "id=${java.net.URLEncoder.encode(url, "UTF-8")}&locale=en&tt=1"
+                .toRequestBody("application/x-www-form-urlencoded".toMediaType())
+
+            val request = Request.Builder()
+                .url("https://ssstik.io/abc?url=dl")
+                .post(requestBody)
+                .header("User-Agent", desktopUserAgent)
+                .header("Referer", "https://ssstik.io/en")
+                .header("Accept", "*/*")
+                .build()
+
+            val response = client.newCall(request).execute()
+            if (!response.isSuccessful) return null
+
+            val html = response.body?.string() ?: return null
+
+            // Extract no-watermark download URL (tikcdn.io URL with class "without_watermark")
+            // Pattern: href="https://tikcdn.io/ssstik/..." class="...without_watermark..."
+            val downloadUrl = extractSsstikDownloadUrl(html) ?: return null
+
+            // Verify the URL returns actual video
+            if (!verifyVideoUrl(downloadUrl)) return null
+
+            // Use thumbnail from tikwm backup if available
+            val thumbnail = lastWatermarkedBackup?.thumbnailUrl ?: ""
+            val title = lastWatermarkedBackup?.title ?: ""
+            val duration = lastWatermarkedBackup?.duration ?: ""
+
+            VideoInfo(
+                videoUrl = downloadUrl,
+                thumbnailUrl = thumbnail,
+                title = title,
+                platform = Platform.TIKTOK,
+                contentType = ContentType.VIDEO,
+                duration = duration
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Extract no-watermark download URL from ssstik HTML response.
+     */
+    private fun extractSsstikDownloadUrl(html: String): String? {
+        // Look for tikcdn.io URL with "without_watermark" class (but NOT "without_watermark_hd")
+        val pattern = Regex("""href="(https://tikcdn\.io/ssstik/[^"]+)"[^>]*class="[^"]*without_watermark(?!_hd)[^"]*"""")
+        val match = pattern.find(html)
+        if (match != null) return match.groupValues[1]
+
+        // Fallback: any tikcdn.io URL
+        val fallbackPattern = Regex("""href="(https://tikcdn\.io/ssstik/[^"]+)"""")
+        val fallbackMatch = fallbackPattern.find(html)
+        return fallbackMatch?.groupValues?.get(1)
+    }
+
+    /**
+     * Try tikwm.com API - reliable free TikTok video extraction.
+     * Returns Pair(VideoInfo?, isSlideshow) - isSlideshow true if post is photos not video.
+     */
+    private fun tryTikWmApi(url: String): Pair<VideoInfo?, Boolean> {
+        return try {
+            val requestBody = "url=${java.net.URLEncoder.encode(url, "UTF-8")}&hd=1"
                 .toRequestBody("application/x-www-form-urlencoded".toMediaType())
 
             val request = Request.Builder()
@@ -196,29 +326,71 @@ class TikTokExtractor : VideoExtractor {
                 .build()
 
             val response = client.newCall(request).execute()
-            if (!response.isSuccessful) return null
+            if (!response.isSuccessful) return Pair(null, false)
 
-            val body = response.body?.string() ?: return null
+            val body = response.body?.string() ?: return Pair(null, false)
             val json = JSONObject(body)
 
-            if (json.optInt("code", -1) != 0) return null
+            if (json.optInt("code", -1) != 0) return Pair(null, false)
 
-            val data = json.optJSONObject("data") ?: return null
+            val data = json.optJSONObject("data") ?: return Pair(null, false)
 
-            // Prefer HD, then no-watermark play, then watermark play
-            val videoUrl = data.optString("hdplay", "").ifEmpty {
-                data.optString("play", "").ifEmpty {
-                    data.optString("wmplay", "")
+            // Detect photo/slideshow posts (duration=0, size=0, images present)
+            // tikwm returns background music audio as "play" URL for these, not video
+            val duration = data.optInt("duration", 0)
+            val size = data.optInt("size", 0)
+            val hdSize = data.optInt("hd_size", 0)
+            val images = data.optJSONArray("images")
+            val hasImages = images != null && images.length() > 0
+
+            if (duration == 0 && size == 0 && hdSize == 0 && hasImages) {
+                // This is a photo/slideshow post, not a video
+                return Pair(null, true)
+            }
+
+            // Collect no-watermark URLs and watermarked URL separately
+            val noWatermarkUrls = mutableListOf<String>()
+            data.optString("hdplay", "").let { if (it.isNotEmpty()) noWatermarkUrls.add(it) }
+            data.optString("play", "").let { if (it.isNotEmpty()) noWatermarkUrls.add(it) }
+            val wmUrl = data.optString("wmplay", "")
+
+            if (noWatermarkUrls.isEmpty() && wmUrl.isEmpty()) return Pair(null, false)
+
+            // Ensure full URLs
+            val fullNoWmUrls = noWatermarkUrls.map { u ->
+                if (!u.startsWith("http")) "https://www.tikwm.com$u" else u
+            }
+            val fullWmUrl = if (wmUrl.isNotEmpty() && !wmUrl.startsWith("http")) "https://www.tikwm.com$wmUrl" else wmUrl
+
+            // Try no-watermark URLs first
+            var videoUrl = ""
+            var isWatermarked = false
+            for (candidateUrl in fullNoWmUrls) {
+                if (verifyVideoUrl(candidateUrl)) {
+                    videoUrl = candidateUrl
+                    break
                 }
             }
 
-            if (videoUrl.isEmpty()) return null
+            // If no-watermark URLs all failed (JPEG/image), save wmplay as fallback
+            // but return null so the main extract() tries cobalt for watermark-free first
+            if (videoUrl.isEmpty()) {
+                if (fullWmUrl.isNotEmpty() && verifyVideoUrl(fullWmUrl)) {
+                    videoUrl = fullWmUrl
+                    isWatermarked = true
+                } else {
+                    return Pair(null, false)
+                }
+            }
 
-            val thumbnailUrl = data.optString("cover", "")
-            val duration = data.optInt("duration", 0)
+            val thumbnailUrl = data.optString("cover", "").ifEmpty {
+                data.optString("origin_cover", "")
+            }
             val title = data.optString("title", "")
 
-            VideoInfo(
+            // If watermarked, return with isSlideshow=false but mark as watermarked
+            // by using a special third value in the return
+            val info = VideoInfo(
                 videoUrl = videoUrl,
                 thumbnailUrl = thumbnailUrl,
                 title = title,
@@ -226,8 +398,38 @@ class TikTokExtractor : VideoExtractor {
                 contentType = ContentType.VIDEO,
                 duration = if (duration > 0) formatDuration(duration) else ""
             )
+            // Return isSlideshow=false, but we track watermark status separately
+            if (isWatermarked) {
+                // Return null so extract() tries cobalt for watermark-free,
+                // but save the watermarked URL as backup
+                lastWatermarkedBackup = info
+                return Pair(null, false)
+            }
+            Pair(info, false)
         } catch (_: Exception) {
-            null
+            Pair(null, false)
+        }
+    }
+
+    /**
+     * Try to fetch thumbnail from oEmbed when other methods don't return one.
+     */
+    private fun tryGetThumbnail(url: String): String {
+        return try {
+            val oembedUrl = "https://www.tiktok.com/oembed?url=$url"
+            val request = Request.Builder()
+                .url(oembedUrl)
+                .header("User-Agent", desktopUserAgent)
+                .build()
+
+            val response = client.newCall(request).execute()
+            if (!response.isSuccessful) return ""
+
+            val body = response.body?.string() ?: return ""
+            val json = JSONObject(body)
+            json.optString("thumbnail_url", "")
+        } catch (_: Exception) {
+            ""
         }
     }
 

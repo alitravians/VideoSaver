@@ -25,7 +25,11 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import android.os.Handler
+import android.os.Looper
+import android.widget.Toast
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -98,21 +102,21 @@ class VideoDownloadService : Service() {
 
                 // Add platform-specific headers
                 val isCobaltStream = videoUrl.contains("stuff.solutions/api/stream")
-                val isTikWmCdn = videoUrl.contains("tiktokcdn") && !isCobaltStream
+                val isTikWmUrl = videoUrl.contains("tikwm.com")
+                val isTikWmCdn = (videoUrl.contains("tiktokcdn") || isTikWmUrl) && !isCobaltStream
                 when (platform) {
                     Platform.INSTAGRAM -> {
                         requestBuilder.header("Referer", "https://www.instagram.com/")
                     }
                     Platform.TIKTOK -> {
                         if (isCobaltStream) {
-                            // Cobalt stream proxy - minimal headers
+                            requestBuilder.header("Accept", "*/*")
+                        } else if (isTikWmUrl) {
                             requestBuilder.header("Accept", "*/*")
                         } else if (isTikWmCdn) {
-                            // Direct TikTok CDN URLs from tikwm - no special headers needed
                             requestBuilder.header("Accept", "*/*")
                             requestBuilder.header("Accept-Encoding", "identity")
                         } else {
-                            // Other TikTok URLs
                             requestBuilder.header("Referer", "https://www.tiktok.com/")
                             requestBuilder.header("Accept", "*/*")
                             requestBuilder.header("Accept-Encoding", "identity")
@@ -160,37 +164,187 @@ class VideoDownloadService : Service() {
                     return@launch
                 }
 
+                val contentType = response.header("Content-Type", "") ?: ""
+                // Reject non-video responses (error pages, text errors, JSON errors, audio-only, images)
+                if (contentType.contains("text/") || contentType.contains("application/json") ||
+                    contentType.contains("audio/mpeg") || contentType.contains("audio/mp3") ||
+                    contentType.contains("image/")) {
+                    body.close()
+                    repository.updateError(downloadId, "الخادم لم يرجع ملف فيديو صالح")
+                    stopSelf()
+                    return@launch
+                }
+
                 val totalBytes = body.contentLength()
+
+                // Reject suspiciously small responses (likely error pages)
+                if (totalBytes in 1..1023) {
+                    body.close()
+                    repository.updateError(downloadId, "الخادم لم يرجع ملف فيديو صالح")
+                    stopSelf()
+                    return@launch
+                }
 
                 repository.updateStatus(downloadId, DownloadStatus.SAVING, 50)
 
-                // Save to Gallery
-                val savedPath = try {
-                    saveToGallery(fileName, body.byteStream(), totalBytes) { progress ->
-                        scope.launch {
-                            try {
-                                repository.updateStatus(downloadId, DownloadStatus.DOWNLOADING, progress)
-                                updateNotification(currentNotifId, "جاري التحميل... $progress%", progress)
-                            } catch (_: Exception) {
-                                // Ignore notification update failures
+                // Step 1: Download to a temporary file first (guaranteed writable)
+                val tempDir = File(applicationContext.cacheDir, "downloads")
+                if (!tempDir.exists()) tempDir.mkdirs()
+                val tempFile = File(tempDir, fileName)
+
+                val downloadedBytes = try {
+                    FileOutputStream(tempFile).use { output ->
+                        val buffer = ByteArray(8192)
+                        var bytesRead: Int
+                        var totalRead = 0L
+                        val inputStream = body.byteStream()
+
+                        while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                            output.write(buffer, 0, bytesRead)
+                            totalRead += bytesRead
+                            if (totalBytes > 0) {
+                                val progress = ((totalRead * 100) / totalBytes).toInt().coerceIn(0, 100)
+                                scope.launch {
+                                    try {
+                                        repository.updateStatus(downloadId, DownloadStatus.DOWNLOADING, progress)
+                                        updateNotification(currentNotifId, "جاري التحميل... $progress%", progress)
+                                    } catch (_: Exception) {}
+                                }
                             }
                         }
+                        output.flush()
+                        output.fd.sync()
+                        totalRead
                     }
                 } catch (e: Exception) {
+                    tempFile.delete()
+                    repository.updateError(downloadId, "فشل في تحميل الملف: ${e.message}")
+                    stopSelf()
+                    return@launch
+                }
+
+                // Step 2: Verify temp file is a valid video (check size + MP4 magic bytes)
+                if (!tempFile.exists() || tempFile.length() < 1024 || downloadedBytes < 1024) {
+                    tempFile.delete()
+                    repository.updateError(downloadId, "الملف المحمّل فارغ أو تالف ($downloadedBytes bytes)")
+                    stopSelf()
+                    return@launch
+                }
+
+                // Check file header to reject non-video content (images, HTML, etc.)
+                val headerBytes = try {
+                    tempFile.inputStream().use { input ->
+                        val h = ByteArray(12)
+                        input.read(h)
+                        h
+                    }
+                } catch (_: Exception) { ByteArray(12) }
+
+                val headerHex = headerBytes.joinToString("") { "%02x".format(it) }
+
+                // First: explicitly reject image files (JPEG, PNG, GIF, WebP)
+                val isImage = headerBytes.size >= 3 && (
+                    // JPEG: FFD8FF
+                    (headerBytes[0] == 0xFF.toByte() && headerBytes[1] == 0xD8.toByte() && headerBytes[2] == 0xFF.toByte()) ||
+                    // PNG: 89504E47
+                    (headerBytes[0] == 0x89.toByte() && headerBytes[1] == 0x50.toByte() && headerBytes[2] == 0x4E.toByte() && headerBytes[3] == 0x47.toByte()) ||
+                    // GIF: 474946
+                    (headerBytes[0] == 0x47.toByte() && headerBytes[1] == 0x49.toByte() && headerBytes[2] == 0x46.toByte()) ||
+                    // WebP: 52494646...57454250
+                    (headerBytes.size >= 12 && headerBytes[0] == 0x52.toByte() && headerBytes[1] == 0x49.toByte() && headerBytes[8] == 0x57.toByte() && headerBytes[9] == 0x45.toByte())
+                )
+
+                if (isImage) {
+                    tempFile.delete()
+                    repository.updateError(downloadId, "الخادم رجع صورة بدل فيديو - حاول مرة أخرى (header: $headerHex)")
+                    stopSelf()
+                    return@launch
+                }
+
+                // Then: check for valid video headers
+                val isLikelyVideo = headerBytes.size >= 8 && (
+                    // Standard MP4: bytes 4-7 = "ftyp"
+                    (headerBytes[4] == 0x66.toByte() && headerBytes[5] == 0x74.toByte() &&
+                     headerBytes[6] == 0x79.toByte() && headerBytes[7] == 0x70.toByte()) ||
+                    // MP4 moov or mdat atoms
+                    (headerBytes[4] == 0x6D.toByte() && headerBytes[5] == 0x6F.toByte()) ||
+                    (headerBytes[4] == 0x6D.toByte() && headerBytes[5] == 0x64.toByte()) ||
+                    // WebM: starts with 0x1A45DFA3
+                    (headerBytes[0] == 0x1A.toByte() && headerBytes[1] == 0x45.toByte()) ||
+                    // ID3 metadata header (TikTok wraps MP4 with ID3 tags): "ID3"
+                    (headerBytes[0] == 0x49.toByte() && headerBytes[1] == 0x44.toByte() && headerBytes[2] == 0x33.toByte()) ||
+                    // MPEG-TS: starts with 0x47 sync byte (exclude GIF)
+                    (headerBytes[0] == 0x47.toByte() && headerBytes[1] != 0x49.toByte()) ||
+                    // FLV: starts with "FLV"
+                    (headerBytes[0] == 0x46.toByte() && headerBytes[1] == 0x4C.toByte() && headerBytes[2] == 0x56.toByte()) ||
+                    // Large files with unknown headers - trust them
+                    tempFile.length() > 100 * 1024
+                )
+
+                if (!isLikelyVideo) {
+                    val isTextContent = headerBytes[0] == '<'.code.toByte() || headerBytes[0] == '{'.code.toByte() || headerBytes[0] == 'H'.code.toByte()
+                    if (isTextContent || tempFile.length() < 10 * 1024) {
+                        tempFile.delete()
+                        repository.updateError(downloadId, "الملف ليس فيديو صالح (header: $headerHex)")
+                        stopSelf()
+                        return@launch
+                    }
+                }
+
+                // Read temp file header for verification later
+                val tempHeader = try {
+                    tempFile.inputStream().use { s ->
+                        val h = ByteArray(8)
+                        s.read(h)
+                        h
+                    }
+                } catch (_: Exception) { ByteArray(8) }
+
+                // Step 3: Save a copy in app's external files for reliable sharing
+                var shareFilePath: String? = null
+                try {
+                    val shareDir = File(applicationContext.getExternalFilesDir(null), "videos")
+                    if (!shareDir.exists()) shareDir.mkdirs()
+                    shareDir.listFiles()?.forEach { it.delete() }
+                    val shareFile = File(shareDir, fileName)
+                    tempFile.copyTo(shareFile, overwrite = true)
+                    // Verify share copy matches temp file
+                    if (shareFile.length() == tempFile.length()) {
+                        shareFilePath = shareFile.absolutePath
+                    }
+                } catch (_: Exception) {
+                    // Non-critical - sharing will fall back to MediaStore URI
+                }
+
+                // Step 4: Copy verified temp file to gallery (direct file copy, not stream)
+                val savedPath = try {
+                    saveToGallery(fileName, tempFile)
+                } catch (e: Exception) {
+                    tempFile.delete()
                     repository.updateError(downloadId, "فشل في حفظ الملف: ${e.message}")
                     stopSelf()
                     return@launch
                 }
 
+                // Clean up temp file
+                tempFile.delete()
+
                 if (savedPath != null) {
                     repository.updateCompleted(downloadId, savedPath)
+
+                    // Show diagnostic Toast with file details
+                    val diagMsg = "تم الحفظ: ${downloadedBytes / 1024}KB | header: ${tempHeader.take(4).joinToString("") { "%02x".format(it) }}"
+                    Handler(Looper.getMainLooper()).post {
+                        Toast.makeText(applicationContext, diagMsg, Toast.LENGTH_LONG).show()
+                    }
+
                     try {
                         showCompletionNotification(currentNotifId, fileName)
                     } catch (_: Exception) {
                         // Ignore notification failures
                     }
                 } else {
-                    repository.updateError(downloadId, "فشل في حفظ الملف في المعرض")
+                    repository.updateError(downloadId, "فشل في حفظ الملف في المعرض (temp: ${downloadedBytes}B)")
                 }
 
             } catch (e: Exception) {
@@ -209,25 +363,22 @@ class VideoDownloadService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun saveToGallery(
-        fileName: String,
-        inputStream: java.io.InputStream,
-        totalBytes: Long,
-        onProgress: (Int) -> Unit
-    ): String? {
+    /**
+     * Save verified temp file to gallery. Uses direct file copy with fd.sync() for reliability.
+     */
+    private fun saveToGallery(fileName: String, sourceFile: File): String? {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            saveWithMediaStore(fileName, inputStream, totalBytes, onProgress)
+            saveWithMediaStore(fileName, sourceFile)
         } else {
-            saveWithLegacy(fileName, inputStream, totalBytes, onProgress)
+            saveWithLegacy(fileName, sourceFile)
         }
     }
 
-    private fun saveWithMediaStore(
-        fileName: String,
-        inputStream: java.io.InputStream,
-        totalBytes: Long,
-        onProgress: (Int) -> Unit
-    ): String? {
+    /**
+     * Save to MediaStore using openFileDescriptor + fd.sync() for reliable writes.
+     * Uses direct file-to-file copy instead of stream for data integrity.
+     */
+    private fun saveWithMediaStore(fileName: String, sourceFile: File): String? {
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
             put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
@@ -239,77 +390,112 @@ class VideoDownloadService : Service() {
             ?: return null
 
         return try {
-            contentResolver.openOutputStream(uri)?.use { output ->
-                val buffer = ByteArray(8192)
-                var bytesRead: Int
-                var totalRead = 0L
+            // Use openFileDescriptor for raw fd access (allows sync)
+            val pfd = contentResolver.openFileDescriptor(uri, "w")
+            if (pfd == null) {
+                contentResolver.delete(uri, null, null)
+                return null
+            }
 
-                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                    output.write(buffer, 0, bytesRead)
-                    totalRead += bytesRead
-                    if (totalBytes > 0) {
-                        val progress = ((totalRead * 100) / totalBytes).toInt().coerceIn(0, 100)
-                        onProgress(progress)
+            var totalWritten = 0L
+            pfd.use { descriptor ->
+                FileOutputStream(descriptor.fileDescriptor).use { output ->
+                    FileInputStream(sourceFile).use { input ->
+                        val buffer = ByteArray(8192)
+                        var bytesRead: Int
+                        while (input.read(buffer).also { bytesRead = it } != -1) {
+                            output.write(buffer, 0, bytesRead)
+                            totalWritten += bytesRead
+                        }
                     }
+                    output.flush()
+                    output.fd.sync() // Force data to physical storage
                 }
             }
 
+            // Verify written size matches source
+            if (totalWritten != sourceFile.length()) {
+                contentResolver.delete(uri, null, null)
+                return null
+            }
+
+            // Mark file as complete
             values.clear()
             values.put(MediaStore.Video.Media.IS_PENDING, 0)
             contentResolver.update(uri, values, null, null)
 
+            // Post-write verification: read back header and compare with source
+            val headerMatch = try {
+                val sourceHeader = ByteArray(8)
+                FileInputStream(sourceFile).use { it.read(sourceHeader) }
+
+                val savedHeader = ByteArray(8)
+                val readBytes = contentResolver.openInputStream(uri)?.use { it.read(savedHeader) } ?: 0
+                if (readBytes < 8) false
+                else sourceHeader.contentEquals(savedHeader)
+            } catch (_: Exception) { false }
+
+            if (!headerMatch) {
+                // Data corruption detected during save
+                contentResolver.delete(uri, null, null)
+                return null
+            }
+
+            // Final size verification
+            val verifiedSize = try {
+                contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: 0L
+            } catch (_: Exception) { 0L }
+
+            if (verifiedSize < 1024) {
+                contentResolver.delete(uri, null, null)
+                return null
+            }
+
             uri.toString()
         } catch (e: Exception) {
-            try {
-                contentResolver.delete(uri, null, null)
-            } catch (_: Exception) {
-                // Ignore cleanup failure
-            }
+            try { contentResolver.delete(uri, null, null) } catch (_: Exception) {}
             null
         }
     }
 
     @Suppress("DEPRECATION")
-    private fun saveWithLegacy(
-        fileName: String,
-        inputStream: java.io.InputStream,
-        totalBytes: Long,
-        onProgress: (Int) -> Unit
-    ): String? {
+    private fun saveWithLegacy(fileName: String, sourceFile: File): String? {
         val dir = File(
             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES),
             VideoSaverApp.FOLDER_NAME
         )
         if (!dir.exists()) dir.mkdirs()
 
-        val file = File(dir, fileName)
+        val destFile = File(dir, fileName)
 
         return try {
-            FileOutputStream(file).use { output ->
-                val buffer = ByteArray(8192)
-                var bytesRead: Int
-                var totalRead = 0L
-
-                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                    output.write(buffer, 0, bytesRead)
-                    totalRead += bytesRead
-                    if (totalBytes > 0) {
-                        val progress = ((totalRead * 100) / totalBytes).toInt().coerceIn(0, 100)
-                        onProgress(progress)
+            // Direct file copy with sync
+            FileInputStream(sourceFile).use { input ->
+                FileOutputStream(destFile).use { output ->
+                    val buffer = ByteArray(8192)
+                    var bytesRead: Int
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        output.write(buffer, 0, bytesRead)
                     }
+                    output.flush()
+                    output.fd.sync()
                 }
+            }
+
+            // Verify saved file matches source
+            if (!destFile.exists() || destFile.length() != sourceFile.length()) {
+                destFile.delete()
+                return null
             }
 
             // Notify media scanner
             try {
                 val intent = Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE)
-                intent.data = Uri.fromFile(file)
+                intent.data = Uri.fromFile(destFile)
                 sendBroadcast(intent)
-            } catch (_: Exception) {
-                // Ignore scanner notification failure
-            }
+            } catch (_: Exception) {}
 
-            file.absolutePath
+            destFile.absolutePath
         } catch (e: Exception) {
             null
         }
