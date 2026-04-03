@@ -5,6 +5,9 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColor
 import androidx.compose.animation.animateContentSize
@@ -65,6 +68,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.layout.ContentScale
@@ -76,8 +80,11 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.res.painterResource
 import coil.compose.AsyncImage
+import com.videosaver.app.R
 import com.videosaver.app.ui.theme.AccentPurple
+import com.videosaver.app.ui.theme.PrimaryBlueDark
 import com.videosaver.app.ui.theme.ErrorRed
 import com.videosaver.app.ui.theme.InstagramGradient1
 import com.videosaver.app.ui.theme.InstagramGradient2
@@ -742,6 +749,7 @@ private fun shareVideoToWhatsApp(context: Context, filePath: String) {
 
 @Composable
 fun DeveloperCredits() {
+    val context = LocalContext.current
     val infiniteTransition = rememberInfiniteTransition(label = "aliAnim")
 
     val color1 by infiniteTransition.animateColor(
@@ -764,40 +772,98 @@ fun DeveloperCredits() {
         label = "aliColor2"
     )
 
-    // Floating/bouncing positional animation
-    val floatOffset by infiniteTransition.animateFloat(
-        initialValue = -4f,
-        targetValue = 4f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(1000, easing = LinearEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "aliFloat"
-    )
-
-    Column(
+    Card(
         modifier = Modifier.fillMaxWidth(),
-        horizontalAlignment = Alignment.CenterHorizontally
+        shape = RoundedCornerShape(20.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 3.dp)
     ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(
+                    brush = Brush.verticalGradient(
+                        colors = listOf(
+                            PrimaryBlue.copy(alpha = 0.05f),
+                            PrimaryBlueDark.copy(alpha = 0.1f)
+                        )
+                    )
+                )
+                .padding(20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Text(
-                text = "تم برمجة و تطوير هذا التطبيق بواسطة ",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                fontSize = 12.sp
+            // Developer photo
+            Image(
+                painter = painterResource(id = R.drawable.developer_photo),
+                contentDescription = "صورة المطور",
+                modifier = Modifier
+                    .size(90.dp)
+                    .shadow(6.dp, CircleShape)
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.surface),
+                contentScale = ContentScale.Crop
             )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // Developer name with gradient animation
             Text(
                 text = "Ali",
-                fontSize = 14.sp,
+                fontSize = 22.sp,
                 fontWeight = FontWeight.Bold,
-                style = MaterialTheme.typography.bodyMedium.copy(
+                style = MaterialTheme.typography.headlineSmall.copy(
                     brush = Brush.linearGradient(listOf(color1, color2))
-                ),
-                modifier = Modifier.offset(y = floatOffset.dp)
+                )
             )
+
+            Spacer(modifier = Modifier.height(4.dp))
+
+            // Role
+            Text(
+                text = "مطور تطبيقات Android",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontWeight = FontWeight.Medium
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // Description
+            Text(
+                text = "تم برمجة وتطوير هذا التطبيق بكل حب واهتمام",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center
+            )
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // GitHub link button
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(PrimaryBlue.copy(alpha = 0.1f))
+                    .clickable {
+                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/alitravians"))
+                        context.startActivity(intent)
+                    }
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center
+            ) {
+                Icon(
+                    Icons.Default.Link,
+                    contentDescription = null,
+                    tint = PrimaryBlue,
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "GitHub",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = PrimaryBlue,
+                    fontWeight = FontWeight.Bold
+                )
+            }
         }
     }
 }

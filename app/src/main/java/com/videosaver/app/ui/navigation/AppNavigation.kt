@@ -27,7 +27,6 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.videosaver.app.ui.screens.HistoryScreen
 import com.videosaver.app.ui.screens.MainScreen
-import com.videosaver.app.ui.screens.AboutDeveloperScreen
 import com.videosaver.app.ui.screens.SettingsScreen
 import com.videosaver.app.ui.theme.PrimaryBlue
 import com.videosaver.app.viewmodel.HistoryViewModel
@@ -43,7 +42,6 @@ sealed class Screen(
     data object Home : Screen("home", "تحميل", Icons.Filled.Download, Icons.Outlined.Download)
     data object History : Screen("history", "السجل", Icons.Filled.History, Icons.Outlined.History)
     data object Settings : Screen("settings", "الإعدادات", Icons.Filled.Settings, Icons.Outlined.Settings)
-    data object AboutDeveloper : Screen("about_developer", "المطور", Icons.Filled.Settings, Icons.Outlined.Settings)
 }
 
 @Composable
@@ -53,7 +51,7 @@ fun AppNavigation(
     settingsViewModel: SettingsViewModel
 ) {
     val navController = rememberNavController()
-    val bottomBarScreens = listOf(Screen.Home, Screen.History, Screen.Settings)
+    val screens = listOf(Screen.Home, Screen.History, Screen.Settings)
 
     Scaffold(
         bottomBar = {
@@ -61,7 +59,7 @@ fun AppNavigation(
                 val navBackStackEntry by navController.currentBackStackEntryAsState()
                 val currentDestination = navBackStackEntry?.destination
 
-                bottomBarScreens.forEach { screen ->
+                screens.forEach { screen ->
                     val selected = currentDestination?.hierarchy?.any {
                         it.route == screen.route
                     } == true
@@ -111,17 +109,7 @@ fun AppNavigation(
                 HistoryScreen(viewModel = historyViewModel)
             }
             composable(Screen.Settings.route) {
-                SettingsScreen(
-                    viewModel = settingsViewModel,
-                    onAboutDeveloperClick = {
-                        navController.navigate(Screen.AboutDeveloper.route)
-                    }
-                )
-            }
-            composable(Screen.AboutDeveloper.route) {
-                AboutDeveloperScreen(
-                    onBackClick = { navController.popBackStack() }
-                )
+                SettingsScreen(viewModel = settingsViewModel)
             }
         }
     }
