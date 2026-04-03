@@ -502,45 +502,34 @@ fun MainScreen(
                                         try {
                                             val filePath = uiState.lastDownloadedFilePath
                                             if (filePath.isNotEmpty()) {
-                                                val fileUri = if (filePath.startsWith("content://")) {
-                                                    Uri.parse(filePath)
-                                                } else {
-                                                    val videoFile = java.io.File(filePath)
-                                                    androidx.core.content.FileProvider.getUriForFile(
-                                                        context,
-                                                        "${context.packageName}.provider",
-                                                        videoFile
-                                                    )
+                                                // Always copy to cache and share via FileProvider for maximum compatibility
+                                                val shareUri = copyToShareCache(context, filePath)
+                                                if (shareUri != null) {
+                                                    val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                                                        type = "video/mp4"
+                                                        putExtra(Intent.EXTRA_STREAM, shareUri)
+                                                        clipData = android.content.ClipData.newRawUri("", shareUri)
+                                                        setPackage("com.whatsapp")
+                                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                                    }
+                                                    context.startActivity(shareIntent)
                                                 }
-                                                val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                                                    type = "video/mp4"
-                                                    putExtra(Intent.EXTRA_STREAM, fileUri)
-                                                    setPackage("com.whatsapp")
-                                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                                }
-                                                context.startActivity(shareIntent)
                                             }
                                         } catch (_: Exception) {
                                             // If WhatsApp not installed, use general share
                                             try {
                                                 val filePath = uiState.lastDownloadedFilePath
                                                 if (filePath.isNotEmpty()) {
-                                                    val fileUri = if (filePath.startsWith("content://")) {
-                                                        Uri.parse(filePath)
-                                                    } else {
-                                                        val videoFile = java.io.File(filePath)
-                                                        androidx.core.content.FileProvider.getUriForFile(
-                                                            context,
-                                                            "${context.packageName}.provider",
-                                                            videoFile
-                                                        )
+                                                    val shareUri = copyToShareCache(context, filePath)
+                                                    if (shareUri != null) {
+                                                        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                                                            type = "video/mp4"
+                                                            putExtra(Intent.EXTRA_STREAM, shareUri)
+                                                            clipData = android.content.ClipData.newRawUri("", shareUri)
+                                                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                                        }
+                                                        context.startActivity(Intent.createChooser(shareIntent, "مشاركة الفيديو"))
                                                     }
-                                                    val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                                                        type = "video/mp4"
-                                                        putExtra(Intent.EXTRA_STREAM, fileUri)
-                                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                                    }
-                                                    context.startActivity(Intent.createChooser(shareIntent, "مشاركة الفيديو"))
                                                 }
                                             } catch (_: Exception) { }
                                         }
@@ -644,6 +633,48 @@ fun MainScreen(
                 }
             }
         )
+    }
+}
+
+/**
+ * Copy video from MediaStore content URI or file path to cache directory,
+ * then return a FileProvider URI for reliable sharing with WhatsApp and other apps.
+ */
+private fun copyToShareCache(context: Context, filePath: String): Uri? {
+    return try {
+        val cacheDir = java.io.File(context.cacheDir, "share")
+        if (!cacheDir.exists()) cacheDir.mkdirs()
+
+        // Clean old cached files
+        cacheDir.listFiles()?.forEach { it.delete() }
+
+        val destFile = java.io.File(cacheDir, "video_${System.currentTimeMillis()}.mp4")
+
+        val sourceUri = if (filePath.startsWith("content://")) {
+            Uri.parse(filePath)
+        } else {
+            Uri.fromFile(java.io.File(filePath))
+        }
+
+        context.contentResolver.openInputStream(sourceUri)?.use { input ->
+            java.io.FileOutputStream(destFile).use { output ->
+                input.copyTo(output)
+            }
+        } ?: return null
+
+        // Verify copied file is not empty
+        if (destFile.length() == 0L) {
+            destFile.delete()
+            return null
+        }
+
+        androidx.core.content.FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.provider",
+            destFile
+        )
+    } catch (_: Exception) {
+        null
     }
 }
 

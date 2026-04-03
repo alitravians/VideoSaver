@@ -38,20 +38,28 @@ class TikTokExtractor : VideoExtractor {
             // Clean URL first
             val cleanedUrl = cleanTikTokUrl(url)
 
-            // Step 1: Try cobalt API + verify stream URL actually works
-            var videoInfo = tryCobaltApiWithVerification(cleanedUrl)
+            // Step 1: Try tikwm.com API FIRST (most reliable, returns thumbnails + working CDN URLs)
+            var videoInfo = tryTikWmApi(cleanedUrl)
 
-            // Step 2: If cobalt failed, try tikwm.com API (reliable, returns working CDN URLs)
+            // Step 2: If tikwm failed, try cobalt API + verify stream URL
             if (videoInfo == null) {
-                videoInfo = tryTikWmApi(cleanedUrl)
+                videoInfo = tryCobaltApiWithVerification(cleanedUrl)
             }
 
-            // Step 3: If tikwm failed, try scraping fallbacks
+            // Step 3: If both failed, try scraping fallbacks
             if (videoInfo == null) {
                 val resolvedUrl = resolveShortUrl(cleanedUrl)
                 videoInfo = tryOEmbedMethod(resolvedUrl)
                     ?: tryHtmlScraping(resolvedUrl)
                     ?: tryApiMethod(resolvedUrl)
+            }
+
+            // Step 4: If we have video but no thumbnail, try to fetch thumbnail separately
+            if (videoInfo != null && videoInfo.thumbnailUrl.isEmpty()) {
+                val thumbnail = tryGetThumbnail(cleanedUrl)
+                if (thumbnail.isNotEmpty()) {
+                    videoInfo = videoInfo.copy(thumbnailUrl = thumbnail)
+                }
             }
 
             if (videoInfo != null) {
@@ -185,7 +193,7 @@ class TikTokExtractor : VideoExtractor {
      */
     private fun tryTikWmApi(url: String): VideoInfo? {
         return try {
-            val requestBody = "url=$url&hd=1"
+            val requestBody = "url=${java.net.URLEncoder.encode(url, "UTF-8")}&hd=1"
                 .toRequestBody("application/x-www-form-urlencoded".toMediaType())
 
             val request = Request.Builder()
@@ -206,7 +214,7 @@ class TikTokExtractor : VideoExtractor {
             val data = json.optJSONObject("data") ?: return null
 
             // Prefer HD, then no-watermark play, then watermark play
-            val videoUrl = data.optString("hdplay", "").ifEmpty {
+            var videoUrl = data.optString("hdplay", "").ifEmpty {
                 data.optString("play", "").ifEmpty {
                     data.optString("wmplay", "")
                 }
@@ -214,7 +222,30 @@ class TikTokExtractor : VideoExtractor {
 
             if (videoUrl.isEmpty()) return null
 
-            val thumbnailUrl = data.optString("cover", "")
+            // Ensure full URL (tikwm sometimes returns relative paths)
+            if (!videoUrl.startsWith("http")) {
+                videoUrl = "https://www.tikwm.com$videoUrl"
+            }
+
+            // Verify the video URL is actually downloadable
+            val verifyRequest = Request.Builder()
+                .url(videoUrl)
+                .header("User-Agent", mobileUserAgent)
+                .header("Range", "bytes=0-1023")
+                .build()
+
+            val verifyResponse = client.newCall(verifyRequest).execute()
+            val verifyCode = verifyResponse.code
+            val verifyContentType = verifyResponse.header("Content-Type", "") ?: ""
+            verifyResponse.close()
+
+            // If verification fails or returns HTML/text, skip
+            if (verifyCode !in 200..299 && verifyCode != 206) return null
+            if (verifyContentType.contains("text/html") || verifyContentType.contains("text/plain")) return null
+
+            val thumbnailUrl = data.optString("cover", "").ifEmpty {
+                data.optString("origin_cover", "")
+            }
             val duration = data.optInt("duration", 0)
             val title = data.optString("title", "")
 
@@ -228,6 +259,28 @@ class TikTokExtractor : VideoExtractor {
             )
         } catch (_: Exception) {
             null
+        }
+    }
+
+    /**
+     * Try to fetch thumbnail from oEmbed when other methods don't return one.
+     */
+    private fun tryGetThumbnail(url: String): String {
+        return try {
+            val oembedUrl = "https://www.tiktok.com/oembed?url=$url"
+            val request = Request.Builder()
+                .url(oembedUrl)
+                .header("User-Agent", desktopUserAgent)
+                .build()
+
+            val response = client.newCall(request).execute()
+            if (!response.isSuccessful) return ""
+
+            val body = response.body?.string() ?: return ""
+            val json = JSONObject(body)
+            json.optString("thumbnail_url", "")
+        } catch (_: Exception) {
+            ""
         }
     }
 
