@@ -623,13 +623,35 @@ private fun shareVideoToWhatsApp(context: Context, filePath: String) {
         var localFile: java.io.File? = null
 
         if (videosDir.exists()) {
-            // Find the most recent video file
-            localFile = videosDir.listFiles()
-                ?.filter { it.isFile && it.length() > 1024 }
-                ?.maxByOrNull { it.lastModified() }
+            // Try to match by filename from the filePath
+            val expectedName = if (filePath.startsWith("content://")) {
+                // Query MediaStore for display name
+                try {
+                    val uri = Uri.parse(filePath)
+                    context.contentResolver.query(uri, arrayOf(android.provider.MediaStore.Video.Media.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                        if (cursor.moveToFirst()) cursor.getString(0) else null
+                    }
+                } catch (_: Exception) { null }
+            } else {
+                java.io.File(filePath).name
+            }
+
+            // First try exact filename match
+            if (expectedName != null) {
+                val matched = videosDir.listFiles()?.find { it.name == expectedName && it.length() > 1024 }
+                if (matched != null) localFile = matched
+            }
+
+            // Fallback: most recent file (only if single file exists to avoid wrong match)
+            if (localFile == null) {
+                val validFiles = videosDir.listFiles()?.filter { it.isFile && it.length() > 1024 }
+                if (validFiles?.size == 1) {
+                    localFile = validFiles.first()
+                }
+            }
         }
 
-        // If we also have the original filename from the path, try matching it
+        // If we have the original filename from a file path, try using it directly
         if (localFile == null && !filePath.startsWith("content://")) {
             val originalFile = java.io.File(filePath)
             if (originalFile.exists() && originalFile.length() > 1024) {
