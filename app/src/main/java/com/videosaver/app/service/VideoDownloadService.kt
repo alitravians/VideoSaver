@@ -243,8 +243,8 @@ class VideoDownloadService : Service() {
                             (header[0] == 0x1A.toByte() && header[1] == 0x45.toByte()) ||
                             // ID3 metadata header (TikTok wraps MP4 with ID3 tags): "ID3"
                             (header[0] == 0x49.toByte() && header[1] == 0x44.toByte() && header[2] == 0x33.toByte()) ||
-                            // MPEG-TS: starts with 0x47
-                            (header[0] == 0x47.toByte()) ||
+                            // MPEG-TS: starts with 0x47 sync byte (exclude GIF which starts with "GI" = 0x47 0x49)
+                            (header[0] == 0x47.toByte() && header[1] != 0x49.toByte()) ||
                             // FLV: starts with "FLV"
                             (header[0] == 0x46.toByte() && header[1] == 0x4C.toByte() && header[2] == 0x56.toByte()) ||
                             // If file is large enough (>100KB), trust it even if header is unknown
