@@ -165,8 +165,8 @@ class VideoDownloadService : Service() {
                 }
 
                 val contentType = response.header("Content-Type", "") ?: ""
-                // Reject HTML responses (error pages, not actual video)
-                if (contentType.contains("text/html") || contentType.contains("application/json")) {
+                // Reject non-video responses (error pages, text errors, JSON errors)
+                if (contentType.contains("text/") || contentType.contains("application/json")) {
                     body.close()
                     repository.updateError(downloadId, "الخادم لم يرجع ملف فيديو صالح")
                     stopSelf()
@@ -174,6 +174,14 @@ class VideoDownloadService : Service() {
                 }
 
                 val totalBytes = body.contentLength()
+
+                // Reject suspiciously small responses (likely error pages)
+                if (totalBytes in 1..1023) {
+                    body.close()
+                    repository.updateError(downloadId, "الخادم لم يرجع ملف فيديو صالح")
+                    stopSelf()
+                    return@launch
+                }
 
                 repository.updateStatus(downloadId, DownloadStatus.SAVING, 50)
 
