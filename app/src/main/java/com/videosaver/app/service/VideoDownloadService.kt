@@ -106,17 +106,13 @@ class VideoDownloadService : Service() {
                     }
                     Platform.TIKTOK -> {
                         if (isCobaltStream) {
-                            // Cobalt stream proxy - minimal headers
                             requestBuilder.header("Accept", "*/*")
-                            } else if (isTikWmUrl) {
-                                // tikwm.com proxy URLs - minimal headers, no TikTok referer
-                                requestBuilder.header("Accept", "*/*")
-                            } else if (isTikWmCdn) {
-                                // Direct TikTok CDN URLs from tikwm - no special headers needed
-                                requestBuilder.header("Accept", "*/*")
-                                requestBuilder.header("Accept-Encoding", "identity")
-                            } else {
-                            // Other TikTok URLs
+                        } else if (isTikWmUrl) {
+                            requestBuilder.header("Accept", "*/*")
+                        } else if (isTikWmCdn) {
+                            requestBuilder.header("Accept", "*/*")
+                            requestBuilder.header("Accept-Encoding", "identity")
+                        } else {
                             requestBuilder.header("Referer", "https://www.tiktok.com/")
                             requestBuilder.header("Accept", "*/*")
                             requestBuilder.header("Accept-Encoding", "identity")
@@ -248,9 +244,13 @@ class VideoDownloadService : Service() {
                 } catch (_: Exception) { false }
 
                 if (!isValidMp4) {
-                    // Log first bytes for debugging
+                    // Log first bytes for debugging (compatible with all Android versions)
                     val firstBytes = try {
-                        tempFile.inputStream().use { it.readNBytes(8).joinToString("") { b -> "%02x".format(b) } }
+                        tempFile.inputStream().use { stream ->
+                            val bytes = ByteArray(8)
+                            stream.read(bytes)
+                            bytes.joinToString("") { b -> "%02x".format(b) }
+                        }
                     } catch (_: Exception) { "unknown" }
                     tempFile.delete()
                     repository.updateError(downloadId, "الملف ليس فيديو صالح (magic: $firstBytes)")
@@ -258,23 +258,28 @@ class VideoDownloadService : Service() {
                     return@launch
                 }
 
-                // Step 3: Copy verified temp file to gallery (MediaStore or legacy)
-                val savedPath = try {
-                    saveToGallery(fileName, tempFile.inputStream(), tempFile.length()) { _ -> }
-                } catch (e: Exception) {
-                    repository.updateError(downloadId, "فشل في حفظ الملف: ${e.message}")
-                    stopSelf()
-                    return@launch
-                }
-
-                // Step 4: Also save a copy in app's external files for reliable sharing
+                // Step 3: Save a copy in app's external files for reliable sharing (before consuming temp file)
                 try {
                     val shareDir = File(applicationContext.getExternalFilesDir(null), "videos")
                     if (!shareDir.exists()) shareDir.mkdirs()
+                    // Clean old share files to save space
+                    shareDir.listFiles()?.forEach { it.delete() }
                     val shareFile = File(shareDir, fileName)
                     tempFile.copyTo(shareFile, overwrite = true)
                 } catch (_: Exception) {
                     // Non-critical - sharing will fall back to MediaStore URI
+                }
+
+                // Step 4: Copy verified temp file to gallery (MediaStore or legacy)
+                val savedPath = try {
+                    tempFile.inputStream().use { stream ->
+                        saveToGallery(fileName, stream, tempFile.length()) { _ -> }
+                    }
+                } catch (e: Exception) {
+                    tempFile.delete()
+                    repository.updateError(downloadId, "فشل في حفظ الملف: ${e.message}")
+                    stopSelf()
+                    return@launch
                 }
 
                 // Clean up temp file
