@@ -12,8 +12,8 @@ android {
         applicationId = "com.videosaver.app"
         minSdk = 26
         targetSdk = 34
-                versionCode = 14
-                versionName = "2.6"
+        versionCode = 13
+        versionName = "2.5"
     }
 
     buildTypes {

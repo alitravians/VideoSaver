@@ -2,11 +2,9 @@ package com.videosaver.app.ui.navigation
 
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.outlined.AutoFixHigh
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Settings
@@ -30,12 +28,10 @@ import androidx.navigation.compose.rememberNavController
 import com.videosaver.app.ui.screens.HistoryScreen
 import com.videosaver.app.ui.screens.MainScreen
 import com.videosaver.app.ui.screens.SettingsScreen
-import com.videosaver.app.ui.screens.WatermarkRemoverScreen
 import com.videosaver.app.ui.theme.PrimaryBlue
 import com.videosaver.app.viewmodel.HistoryViewModel
 import com.videosaver.app.viewmodel.MainViewModel
 import com.videosaver.app.viewmodel.SettingsViewModel
-import com.videosaver.app.viewmodel.WatermarkViewModel
 
 sealed class Screen(
     val route: String,
@@ -44,7 +40,6 @@ sealed class Screen(
     val unselectedIcon: ImageVector
 ) {
     data object Home : Screen("home", "تحميل", Icons.Filled.Download, Icons.Outlined.Download)
-    data object Watermark : Screen("watermark", "إزالة العلامة", Icons.Filled.AutoFixHigh, Icons.Outlined.AutoFixHigh)
     data object History : Screen("history", "السجل", Icons.Filled.History, Icons.Outlined.History)
     data object Settings : Screen("settings", "الإعدادات", Icons.Filled.Settings, Icons.Outlined.Settings)
 }
@@ -52,12 +47,11 @@ sealed class Screen(
 @Composable
 fun AppNavigation(
     mainViewModel: MainViewModel,
-    watermarkViewModel: WatermarkViewModel,
     historyViewModel: HistoryViewModel,
     settingsViewModel: SettingsViewModel
 ) {
     val navController = rememberNavController()
-    val screens = listOf(Screen.Home, Screen.Watermark, Screen.History, Screen.Settings)
+    val screens = listOf(Screen.Home, Screen.History, Screen.Settings)
 
     Scaffold(
         bottomBar = {
@@ -110,9 +104,6 @@ fun AppNavigation(
         ) {
             composable(Screen.Home.route) {
                 MainScreen(viewModel = mainViewModel)
-            }
-            composable(Screen.Watermark.route) {
-                WatermarkRemoverScreen(viewModel = watermarkViewModel)
             }
             composable(Screen.History.route) {
                 HistoryScreen(viewModel = historyViewModel)

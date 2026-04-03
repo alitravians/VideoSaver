@@ -25,12 +25,10 @@ import com.videosaver.app.util.SettingsManager
 import com.videosaver.app.viewmodel.HistoryViewModel
 import com.videosaver.app.viewmodel.MainViewModel
 import com.videosaver.app.viewmodel.SettingsViewModel
-import com.videosaver.app.viewmodel.WatermarkViewModel
 
 class MainActivity : ComponentActivity() {
 
     private val mainViewModel: MainViewModel by viewModels()
-    private val watermarkViewModel: WatermarkViewModel by viewModels()
     private val historyViewModel: HistoryViewModel by viewModels()
     private val settingsViewModel: SettingsViewModel by viewModels()
     private lateinit var settingsManager: SettingsManager
@@ -61,7 +59,6 @@ class MainActivity : ComponentActivity() {
                     ) {
                         AppNavigation(
                             mainViewModel = mainViewModel,
-                            watermarkViewModel = watermarkViewModel,
                             historyViewModel = historyViewModel,
                             settingsViewModel = settingsViewModel
                         )
