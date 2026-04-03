@@ -225,37 +225,58 @@ class VideoDownloadService : Service() {
                     return@launch
                 }
 
-                // Check MP4 magic bytes (ftyp atom at offset 4-7)
-                val isValidMp4 = try {
+                // Check file header to reject obviously non-video content (HTML error pages, etc.)
+                val isLikelyVideo = try {
                     tempFile.inputStream().use { input ->
                         val header = ByteArray(12)
                         val read = input.read(header)
-                        read >= 8 && (
+                        if (read < 8) false
+                        else {
                             // Standard MP4: bytes 4-7 = "ftyp"
                             (header[4] == 0x66.toByte() && header[5] == 0x74.toByte() &&
                              header[6] == 0x79.toByte() && header[7] == 0x70.toByte()) ||
-                            // Some videos start with moov or mdat atoms
+                            // MP4 moov or mdat atoms
                             (header[4] == 0x6D.toByte() && header[5] == 0x6F.toByte()) ||
                             (header[4] == 0x6D.toByte() && header[5] == 0x64.toByte()) ||
                             // WebM: starts with 0x1A45DFA3
-                            (header[0] == 0x1A.toByte() && header[1] == 0x45.toByte())
-                        )
+                            (header[0] == 0x1A.toByte() && header[1] == 0x45.toByte()) ||
+                            // ID3 metadata header (TikTok wraps MP4 with ID3 tags): "ID3"
+                            (header[0] == 0x49.toByte() && header[1] == 0x44.toByte() && header[2] == 0x33.toByte()) ||
+                            // MPEG-TS: starts with 0x47
+                            (header[0] == 0x47.toByte()) ||
+                            // FLV: starts with "FLV"
+                            (header[0] == 0x46.toByte() && header[1] == 0x4C.toByte() && header[2] == 0x56.toByte()) ||
+                            // If file is large enough (>100KB), trust it even if header is unknown
+                            // (some CDNs prepend custom headers)
+                            tempFile.length() > 100 * 1024
+                        }
                     }
                 } catch (_: Exception) { false }
 
-                if (!isValidMp4) {
-                    // Log first bytes for debugging (compatible with all Android versions)
+                // Only reject if it looks like an HTML error page or text response
+                if (!isLikelyVideo) {
                     val firstBytes = try {
                         tempFile.inputStream().use { stream ->
-                            val bytes = ByteArray(8)
+                            val bytes = ByteArray(16)
                             stream.read(bytes)
                             bytes.joinToString("") { b -> "%02x".format(b) }
                         }
                     } catch (_: Exception) { "unknown" }
-                    tempFile.delete()
-                    repository.updateError(downloadId, "الملف ليس فيديو صالح (magic: $firstBytes)")
-                    stopSelf()
-                    return@launch
+                    // Check if it's HTML/text (starts with '<' or '{')
+                    val isTextContent = try {
+                        tempFile.inputStream().use { stream ->
+                            val first = stream.read()
+                            first == '<'.code || first == '{'.code || first == 'H'.code
+                        }
+                    } catch (_: Exception) { false }
+
+                    if (isTextContent || tempFile.length() < 10 * 1024) {
+                        tempFile.delete()
+                        repository.updateError(downloadId, "الملف ليس فيديو صالح (magic: $firstBytes)")
+                        stopSelf()
+                        return@launch
+                    }
+                    // If not text and file is reasonably large, proceed anyway
                 }
 
                 // Step 3: Save a copy in app's external files for reliable sharing (before consuming temp file)
