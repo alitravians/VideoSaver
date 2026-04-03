@@ -25,7 +25,11 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import android.os.Handler
+import android.os.Looper
+import android.widget.Toast
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -280,23 +284,34 @@ class VideoDownloadService : Service() {
                     // If not text and file is reasonably large, proceed anyway
                 }
 
-                // Step 3: Save a copy in app's external files for reliable sharing (before consuming temp file)
+                // Read temp file header for verification later
+                val tempHeader = try {
+                    tempFile.inputStream().use { s ->
+                        val h = ByteArray(8)
+                        s.read(h)
+                        h
+                    }
+                } catch (_: Exception) { ByteArray(8) }
+
+                // Step 3: Save a copy in app's external files for reliable sharing
+                var shareFilePath: String? = null
                 try {
                     val shareDir = File(applicationContext.getExternalFilesDir(null), "videos")
                     if (!shareDir.exists()) shareDir.mkdirs()
-                    // Clean old share files to save space
                     shareDir.listFiles()?.forEach { it.delete() }
                     val shareFile = File(shareDir, fileName)
                     tempFile.copyTo(shareFile, overwrite = true)
+                    // Verify share copy matches temp file
+                    if (shareFile.length() == tempFile.length()) {
+                        shareFilePath = shareFile.absolutePath
+                    }
                 } catch (_: Exception) {
                     // Non-critical - sharing will fall back to MediaStore URI
                 }
 
-                // Step 4: Copy verified temp file to gallery (MediaStore or legacy)
+                // Step 4: Copy verified temp file to gallery (direct file copy, not stream)
                 val savedPath = try {
-                    tempFile.inputStream().use { stream ->
-                        saveToGallery(fileName, stream, tempFile.length()) { _ -> }
-                    }
+                    saveToGallery(fileName, tempFile)
                 } catch (e: Exception) {
                     tempFile.delete()
                     repository.updateError(downloadId, "فشل في حفظ الملف: ${e.message}")
@@ -309,13 +324,20 @@ class VideoDownloadService : Service() {
 
                 if (savedPath != null) {
                     repository.updateCompleted(downloadId, savedPath)
+
+                    // Show diagnostic Toast with file details
+                    val diagMsg = "تم الحفظ: ${downloadedBytes / 1024}KB | header: ${tempHeader.take(4).joinToString("") { "%02x".format(it) }}"
+                    Handler(Looper.getMainLooper()).post {
+                        Toast.makeText(applicationContext, diagMsg, Toast.LENGTH_LONG).show()
+                    }
+
                     try {
                         showCompletionNotification(currentNotifId, fileName)
                     } catch (_: Exception) {
                         // Ignore notification failures
                     }
                 } else {
-                    repository.updateError(downloadId, "فشل في حفظ الملف في المعرض")
+                    repository.updateError(downloadId, "فشل في حفظ الملف في المعرض (temp: ${downloadedBytes}B)")
                 }
 
             } catch (e: Exception) {
@@ -334,25 +356,22 @@ class VideoDownloadService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun saveToGallery(
-        fileName: String,
-        inputStream: java.io.InputStream,
-        totalBytes: Long,
-        onProgress: (Int) -> Unit
-    ): String? {
+    /**
+     * Save verified temp file to gallery. Uses direct file copy with fd.sync() for reliability.
+     */
+    private fun saveToGallery(fileName: String, sourceFile: File): String? {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            saveWithMediaStore(fileName, inputStream, totalBytes, onProgress)
+            saveWithMediaStore(fileName, sourceFile)
         } else {
-            saveWithLegacy(fileName, inputStream, totalBytes, onProgress)
+            saveWithLegacy(fileName, sourceFile)
         }
     }
 
-    private fun saveWithMediaStore(
-        fileName: String,
-        inputStream: java.io.InputStream,
-        totalBytes: Long,
-        onProgress: (Int) -> Unit
-    ): String? {
+    /**
+     * Save to MediaStore using openFileDescriptor + fd.sync() for reliable writes.
+     * Uses direct file-to-file copy instead of stream for data integrity.
+     */
+    private fun saveWithMediaStore(fileName: String, sourceFile: File): String? {
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
             put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
@@ -364,110 +383,112 @@ class VideoDownloadService : Service() {
             ?: return null
 
         return try {
-            val outputStream = contentResolver.openOutputStream(uri)
-            if (outputStream == null) {
+            // Use openFileDescriptor for raw fd access (allows sync)
+            val pfd = contentResolver.openFileDescriptor(uri, "w")
+            if (pfd == null) {
                 contentResolver.delete(uri, null, null)
                 return null
             }
-            var totalRead = 0L
-            outputStream.use { output ->
-                val buffer = ByteArray(8192)
-                var bytesRead: Int
 
-                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                    output.write(buffer, 0, bytesRead)
-                    totalRead += bytesRead
-                    if (totalBytes > 0) {
-                        val progress = ((totalRead * 100) / totalBytes).toInt().coerceIn(0, 100)
-                        onProgress(progress)
+            var totalWritten = 0L
+            pfd.use { descriptor ->
+                FileOutputStream(descriptor.fileDescriptor).use { output ->
+                    FileInputStream(sourceFile).use { input ->
+                        val buffer = ByteArray(8192)
+                        var bytesRead: Int
+                        while (input.read(buffer).also { bytesRead = it } != -1) {
+                            output.write(buffer, 0, bytesRead)
+                            totalWritten += bytesRead
+                        }
                     }
+                    output.flush()
+                    output.fd.sync() // Force data to physical storage
                 }
-                // Explicit flush to ensure all data is written to disk
-                output.flush()
             }
 
-            // Verify file is not empty based on bytes written
-            if (totalRead == 0L) {
+            // Verify written size matches source
+            if (totalWritten != sourceFile.length()) {
                 contentResolver.delete(uri, null, null)
                 return null
             }
 
-            // Mark file as complete (not pending)
+            // Mark file as complete
             values.clear()
             values.put(MediaStore.Video.Media.IS_PENDING, 0)
             contentResolver.update(uri, values, null, null)
 
-            // Post-write verification: re-read the file to confirm data was persisted
+            // Post-write verification: read back header and compare with source
+            val headerMatch = try {
+                val sourceHeader = ByteArray(8)
+                FileInputStream(sourceFile).use { it.read(sourceHeader) }
+
+                val savedHeader = ByteArray(8)
+                val readBytes = contentResolver.openInputStream(uri)?.use { it.read(savedHeader) } ?: 0
+                if (readBytes < 8) false
+                else sourceHeader.contentEquals(savedHeader)
+            } catch (_: Exception) { false }
+
+            if (!headerMatch) {
+                // Data corruption detected during save
+                contentResolver.delete(uri, null, null)
+                return null
+            }
+
+            // Final size verification
             val verifiedSize = try {
-                contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: 0L
+                contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: 0L
             } catch (_: Exception) { 0L }
 
             if (verifiedSize < 1024) {
-                // File was not properly saved - delete and fail
                 contentResolver.delete(uri, null, null)
                 return null
             }
 
             uri.toString()
         } catch (e: Exception) {
-            try {
-                contentResolver.delete(uri, null, null)
-            } catch (_: Exception) {
-                // Ignore cleanup failure
-            }
+            try { contentResolver.delete(uri, null, null) } catch (_: Exception) {}
             null
         }
     }
 
     @Suppress("DEPRECATION")
-    private fun saveWithLegacy(
-        fileName: String,
-        inputStream: java.io.InputStream,
-        totalBytes: Long,
-        onProgress: (Int) -> Unit
-    ): String? {
+    private fun saveWithLegacy(fileName: String, sourceFile: File): String? {
         val dir = File(
             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES),
             VideoSaverApp.FOLDER_NAME
         )
         if (!dir.exists()) dir.mkdirs()
 
-        val file = File(dir, fileName)
+        val destFile = File(dir, fileName)
 
         return try {
-            FileOutputStream(file).use { output ->
-                val buffer = ByteArray(8192)
-                var bytesRead: Int
-                var totalRead = 0L
-
-                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                    output.write(buffer, 0, bytesRead)
-                    totalRead += bytesRead
-                    if (totalBytes > 0) {
-                        val progress = ((totalRead * 100) / totalBytes).toInt().coerceIn(0, 100)
-                        onProgress(progress)
+            // Direct file copy with sync
+            FileInputStream(sourceFile).use { input ->
+                FileOutputStream(destFile).use { output ->
+                    val buffer = ByteArray(8192)
+                    var bytesRead: Int
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        output.write(buffer, 0, bytesRead)
                     }
+                    output.flush()
+                    output.fd.sync()
                 }
-                output.flush()
-                output.fd.sync()
             }
 
-            // Verify saved file is valid
-            if (!file.exists() || file.length() < 1024) {
-                file.delete()
+            // Verify saved file matches source
+            if (!destFile.exists() || destFile.length() != sourceFile.length()) {
+                destFile.delete()
                 return null
             }
 
             // Notify media scanner
             try {
                 val intent = Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE)
-                intent.data = Uri.fromFile(file)
+                intent.data = Uri.fromFile(destFile)
                 sendBroadcast(intent)
-            } catch (_: Exception) {
-                // Ignore scanner notification failure
-            }
+            } catch (_: Exception) {}
 
-            file.absolutePath
+            destFile.absolutePath
         } catch (e: Exception) {
             null
         }
