@@ -605,10 +605,9 @@ fun MainScreen(
 }
 
 /**
- * Share video to WhatsApp with robust error handling.
- * For content:// URIs (MediaStore, Android 10+), shares directly.
- * For file paths, copies to cache and uses FileProvider.
- * Shows Toast messages for any errors.
+ * Share video to WhatsApp via FileProvider for maximum compatibility.
+ * Always copies to app's external cache first (WhatsApp reads FileProvider URIs reliably).
+ * Shows Toast messages for any errors with diagnostic info.
  */
 private fun shareVideoToWhatsApp(context: Context, filePath: String) {
     if (filePath.isEmpty()) {
@@ -617,63 +616,78 @@ private fun shareVideoToWhatsApp(context: Context, filePath: String) {
     }
 
     try {
-        val shareUri: Uri
-        val needsGrantPermission: Boolean
-
-        if (filePath.startsWith("content://")) {
-            // MediaStore content URI (Android 10+) - can be shared directly
-            val contentUri = Uri.parse(filePath)
-            // Verify the file has actual content before sharing
-            val fileSize = try {
-                context.contentResolver.openAssetFileDescriptor(contentUri, "r")?.use { it.length } ?: 0L
-            } catch (_: Exception) { 0L }
-            if (fileSize < 1024) {
-                Toast.makeText(context, "الملف فارغ أو تالف - حاول تحميل الفيديو مرة أخرى", Toast.LENGTH_LONG).show()
-                return
-            }
-            shareUri = contentUri
-            needsGrantPermission = true
+        // Step 1: Read the video data from source (MediaStore content URI or file path)
+        val sourceUri = if (filePath.startsWith("content://")) {
+            Uri.parse(filePath)
         } else {
-            // File path - verify file exists and is valid, then use FileProvider
             val file = java.io.File(filePath)
             if (!file.exists()) {
                 Toast.makeText(context, "الملف غير موجود", Toast.LENGTH_SHORT).show()
                 return
             }
-            if (file.length() < 1024) {
-                Toast.makeText(context, "الملف فارغ أو تالف", Toast.LENGTH_SHORT).show()
-                return
-            }
-            shareUri = androidx.core.content.FileProvider.getUriForFile(
-                context,
-                "${context.packageName}.provider",
-                file
-            )
-            needsGrantPermission = true
+            Uri.fromFile(file)
         }
 
-        // Try WhatsApp first
+        // Step 2: Copy to external cache directory for FileProvider sharing
+        val cacheDir = java.io.File(context.externalCacheDir ?: context.cacheDir, "share")
+        if (!cacheDir.exists()) cacheDir.mkdirs()
+        // Clean old cached files
+        cacheDir.listFiles()?.forEach { it.delete() }
+
+        val destFile = java.io.File(cacheDir, "video_${System.currentTimeMillis()}.mp4")
+
+        val bytesCopied = try {
+            context.contentResolver.openInputStream(sourceUri)?.use { input ->
+                java.io.FileOutputStream(destFile).use { output ->
+                    val buffer = ByteArray(8192)
+                    var total = 0L
+                    var bytesRead: Int
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        output.write(buffer, 0, bytesRead)
+                        total += bytesRead
+                    }
+                    output.flush()
+                    output.fd.sync()
+                    total
+                }
+            } ?: 0L
+        } catch (e: Exception) {
+            Toast.makeText(context, "فشل نسخ الملف: ${e.message}", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        // Step 3: Verify the copied file has actual video content
+        if (bytesCopied < 1024 || !destFile.exists() || destFile.length() < 1024) {
+            destFile.delete()
+            Toast.makeText(context, "الملف فارغ أو تالف (${bytesCopied} bytes) - حاول تحميل الفيديو مرة أخرى", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        // Step 4: Create FileProvider URI
+        val shareUri = androidx.core.content.FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.provider",
+            destFile
+        )
+
+        // Step 5: Share to WhatsApp (or general share as fallback)
         try {
             val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                type = "video/*"
+                type = "video/mp4"
                 putExtra(Intent.EXTRA_STREAM, shareUri)
                 clipData = android.content.ClipData.newRawUri("", shareUri)
                 setPackage("com.whatsapp")
-                if (needsGrantPermission) {
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                }
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             context.startActivity(shareIntent)
         } catch (_: Exception) {
-            // WhatsApp not installed or failed - try general share
+            // WhatsApp not installed - try general share
             try {
                 val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                    type = "video/*"
+                    type = "video/mp4"
                     putExtra(Intent.EXTRA_STREAM, shareUri)
                     clipData = android.content.ClipData.newRawUri("", shareUri)
-                    if (needsGrantPermission) {
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    }
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
                 context.startActivity(Intent.createChooser(shareIntent, "مشاركة الفيديو"))
             } catch (_: Exception) {
@@ -681,7 +695,7 @@ private fun shareVideoToWhatsApp(context: Context, filePath: String) {
             }
         }
     } catch (e: Exception) {
-        Toast.makeText(context, "خطأ في مشاركة الفيديو: ${e.message}", Toast.LENGTH_SHORT).show()
+        Toast.makeText(context, "خطأ: ${e.message}", Toast.LENGTH_SHORT).show()
     }
 }
 

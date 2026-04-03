@@ -278,17 +278,31 @@ class VideoDownloadService : Service() {
                         onProgress(progress)
                     }
                 }
+                // Explicit flush to ensure all data is written to disk
+                output.flush()
             }
 
-            // Verify file is not empty
+            // Verify file is not empty based on bytes written
             if (totalRead == 0L) {
                 contentResolver.delete(uri, null, null)
                 return null
             }
 
+            // Mark file as complete (not pending)
             values.clear()
             values.put(MediaStore.Video.Media.IS_PENDING, 0)
             contentResolver.update(uri, values, null, null)
+
+            // Post-write verification: re-read the file to confirm data was persisted
+            val verifiedSize = try {
+                contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: 0L
+            } catch (_: Exception) { 0L }
+
+            if (verifiedSize < 1024) {
+                // File was not properly saved - delete and fail
+                contentResolver.delete(uri, null, null)
+                return null
+            }
 
             uri.toString()
         } catch (e: Exception) {
@@ -330,6 +344,14 @@ class VideoDownloadService : Service() {
                         onProgress(progress)
                     }
                 }
+                output.flush()
+                output.fd.sync()
+            }
+
+            // Verify saved file is valid
+            if (!file.exists() || file.length() < 1024) {
+                file.delete()
+                return null
             }
 
             // Notify media scanner
