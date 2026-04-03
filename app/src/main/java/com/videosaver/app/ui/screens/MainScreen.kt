@@ -43,7 +43,6 @@ import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -533,26 +532,6 @@ fun MainScreen(
                                     Text("تحميل آخر")
                                 }
 
-                                Spacer(modifier = Modifier.width(8.dp))
-
-                                // Diagnostic Button
-                                OutlinedButton(
-                                    onClick = {
-                                        showDiagnosticDialog(context, uiState.lastDownloadedFilePath)
-                                    },
-                                    shape = RoundedCornerShape(12.dp),
-                                    colors = ButtonDefaults.outlinedButtonColors(
-                                        contentColor = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                ) {
-                                    Icon(
-                                        Icons.Default.BugReport,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text("حالة الاخطاء")
-                                }
                             }
                         }
                     }
@@ -624,91 +603,6 @@ fun MainScreen(
             }
         )
     }
-}
-
-/**
- * Show diagnostic dialog with file details that the user can copy and share.
- */
-private fun showDiagnosticDialog(context: Context, filePath: String) {
-    val sb = StringBuilder()
-    sb.appendLine("=== Video Saver Diagnostic ===")
-    sb.appendLine("FilePath: $filePath")
-
-    // Check local share copy
-    val videosDir = java.io.File(context.getExternalFilesDir(null), "videos")
-    if (videosDir.exists()) {
-        val files = videosDir.listFiles()
-        sb.appendLine("\n--- Local Share Dir ---")
-        sb.appendLine("Path: ${videosDir.absolutePath}")
-        sb.appendLine("Files: ${files?.size ?: 0}")
-        files?.forEach { f ->
-            val header = try {
-                f.inputStream().use { s ->
-                    val h = ByteArray(8)
-                    s.read(h)
-                    h.joinToString("") { "%02x".format(it) }
-                }
-            } catch (_: Exception) { "error" }
-            sb.appendLine("  ${f.name}: ${f.length()} bytes | header: $header")
-        }
-    } else {
-        sb.appendLine("\nLocal share dir: NOT FOUND")
-    }
-
-    // Check MediaStore file
-    if (filePath.startsWith("content://")) {
-        sb.appendLine("\n--- MediaStore ---")
-        try {
-            val uri = android.net.Uri.parse(filePath)
-            // Get display name
-            context.contentResolver.query(uri, arrayOf(
-                android.provider.MediaStore.Video.Media.DISPLAY_NAME,
-                android.provider.MediaStore.Video.Media.SIZE
-            ), null, null, null)?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    sb.appendLine("Name: ${cursor.getString(0)}")
-                    sb.appendLine("Size (DB): ${cursor.getLong(1)} bytes")
-                }
-            }
-            // Read actual size and header
-            val actualSize = try {
-                context.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: -1
-            } catch (_: Exception) { -1L }
-            sb.appendLine("Size (actual): $actualSize bytes")
-
-            val msHeader = try {
-                context.contentResolver.openInputStream(uri)?.use { s ->
-                    val h = ByteArray(8)
-                    s.read(h)
-                    h.joinToString("") { "%02x".format(it) }
-                } ?: "null stream"
-            } catch (e: Exception) { "error: ${e.message}" }
-            sb.appendLine("Header: $msHeader")
-        } catch (e: Exception) {
-            sb.appendLine("Error: ${e.message}")
-        }
-    }
-
-    sb.appendLine("\nAndroid: ${android.os.Build.VERSION.SDK_INT} (${android.os.Build.VERSION.RELEASE})")
-    sb.appendLine("Device: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
-
-    val diagText = sb.toString()
-
-    // Copy to clipboard and show dialog
-    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-    clipboard.setPrimaryClip(android.content.ClipData.newPlainText("diagnostic", diagText))
-
-    android.app.AlertDialog.Builder(context)
-        .setTitle("معلومات تشخيصية")
-        .setMessage(diagText)
-        .setPositiveButton("تم النسخ") { d, _ -> d.dismiss() }
-        .setNeutralButton("نسخ مرة أخرى") { _, _ ->
-            clipboard.setPrimaryClip(android.content.ClipData.newPlainText("diagnostic", diagText))
-            Toast.makeText(context, "تم النسخ", Toast.LENGTH_SHORT).show()
-        }
-        .show()
-
-    Toast.makeText(context, "تم نسخ المعلومات التشخيصية", Toast.LENGTH_SHORT).show()
 }
 
 /**

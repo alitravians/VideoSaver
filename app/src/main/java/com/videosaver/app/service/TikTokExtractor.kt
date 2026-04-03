@@ -231,12 +231,10 @@ class TikTokExtractor : VideoExtractor {
             }
 
             // Collect all available video URLs to try (CDN may serve images in some regions)
+            // Priority: HD no-watermark > standard no-watermark > watermarked
             val candidateUrls = mutableListOf<String>()
-            // Try play first (standard quality, most reliable across regions)
-            data.optString("play", "").let { if (it.isNotEmpty()) candidateUrls.add(it) }
-            // Then HD
             data.optString("hdplay", "").let { if (it.isNotEmpty()) candidateUrls.add(it) }
-            // Then watermarked as last resort
+            data.optString("play", "").let { if (it.isNotEmpty()) candidateUrls.add(it) }
             data.optString("wmplay", "").let { if (it.isNotEmpty()) candidateUrls.add(it) }
 
             if (candidateUrls.isEmpty()) return Pair(null, false)
