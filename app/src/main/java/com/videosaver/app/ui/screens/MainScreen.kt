@@ -835,35 +835,6 @@ fun DeveloperCredits() {
                 textAlign = TextAlign.Center
             )
 
-            Spacer(modifier = Modifier.height(14.dp))
-
-            // GitHub link button
-            Row(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(PrimaryBlue.copy(alpha = 0.1f))
-                    .clickable {
-                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/alitravians"))
-                        context.startActivity(intent)
-                    }
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.Center
-            ) {
-                Icon(
-                    Icons.Default.Link,
-                    contentDescription = null,
-                    tint = PrimaryBlue,
-                    modifier = Modifier.size(16.dp)
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = "GitHub",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = PrimaryBlue,
-                    fontWeight = FontWeight.Bold
-                )
-            }
         }
     }
 }
