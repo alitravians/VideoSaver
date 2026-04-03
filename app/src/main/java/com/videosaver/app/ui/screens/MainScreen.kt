@@ -606,7 +606,8 @@ fun MainScreen(
 
 /**
  * Share video to WhatsApp via FileProvider for maximum compatibility.
- * Always copies to app's external cache first (WhatsApp reads FileProvider URIs reliably).
+ * First checks for local copy saved during download (instant, no ANR risk).
+ * Falls back to copying from MediaStore if local copy not found.
  * Shows Toast messages for any errors with diagnostic info.
  */
 private fun shareVideoToWhatsApp(context: Context, filePath: String) {
@@ -616,61 +617,78 @@ private fun shareVideoToWhatsApp(context: Context, filePath: String) {
     }
 
     try {
-        // Step 1: Read the video data from source (MediaStore content URI or file path)
-        val sourceUri = if (filePath.startsWith("content://")) {
-            Uri.parse(filePath)
+        // Step 1: Try to find the local copy saved during download (in app's external files)
+        // This avoids any MediaStore read issues and is instant (no file copy needed)
+        val videosDir = java.io.File(context.getExternalFilesDir(null), "videos")
+        var localFile: java.io.File? = null
+
+        if (videosDir.exists()) {
+            // Find the most recent video file
+            localFile = videosDir.listFiles()
+                ?.filter { it.isFile && it.length() > 1024 }
+                ?.maxByOrNull { it.lastModified() }
+        }
+
+        // If we also have the original filename from the path, try matching it
+        if (localFile == null && !filePath.startsWith("content://")) {
+            val originalFile = java.io.File(filePath)
+            if (originalFile.exists() && originalFile.length() > 1024) {
+                localFile = originalFile
+            }
+        }
+
+        val shareFile: java.io.File
+        if (localFile != null && localFile.exists() && localFile.length() > 1024) {
+            // Use the local copy directly - no MediaStore access needed
+            shareFile = localFile
         } else {
-            val file = java.io.File(filePath)
-            if (!file.exists()) {
-                Toast.makeText(context, "الملف غير موجود", Toast.LENGTH_SHORT).show()
+            // Fallback: try to copy from MediaStore content URI
+            if (!filePath.startsWith("content://")) {
+                Toast.makeText(context, "الملف غير موجود - حاول تحميل الفيديو مرة أخرى", Toast.LENGTH_LONG).show()
                 return
             }
-            Uri.fromFile(file)
-        }
 
-        // Step 2: Copy to external cache directory for FileProvider sharing
-        val cacheDir = java.io.File(context.externalCacheDir ?: context.cacheDir, "share")
-        if (!cacheDir.exists()) cacheDir.mkdirs()
-        // Clean old cached files
-        cacheDir.listFiles()?.forEach { it.delete() }
+            val sourceUri = Uri.parse(filePath)
+            val cacheDir = java.io.File(context.externalCacheDir ?: context.cacheDir, "share")
+            if (!cacheDir.exists()) cacheDir.mkdirs()
+            cacheDir.listFiles()?.forEach { it.delete() }
 
-        val destFile = java.io.File(cacheDir, "video_${System.currentTimeMillis()}.mp4")
-
-        val bytesCopied = try {
-            context.contentResolver.openInputStream(sourceUri)?.use { input ->
-                java.io.FileOutputStream(destFile).use { output ->
-                    val buffer = ByteArray(8192)
-                    var total = 0L
-                    var bytesRead: Int
-                    while (input.read(buffer).also { bytesRead = it } != -1) {
-                        output.write(buffer, 0, bytesRead)
-                        total += bytesRead
+            shareFile = java.io.File(cacheDir, "video_${System.currentTimeMillis()}.mp4")
+            val bytesCopied = try {
+                context.contentResolver.openInputStream(sourceUri)?.use { input ->
+                    java.io.FileOutputStream(shareFile).use { output ->
+                        val buffer = ByteArray(8192)
+                        var total = 0L
+                        var bytesRead: Int
+                        while (input.read(buffer).also { bytesRead = it } != -1) {
+                            output.write(buffer, 0, bytesRead)
+                            total += bytesRead
+                        }
+                        output.flush()
+                        output.fd.sync()
+                        total
                     }
-                    output.flush()
-                    output.fd.sync()
-                    total
-                }
-            } ?: 0L
-        } catch (e: Exception) {
-            Toast.makeText(context, "فشل نسخ الملف: ${e.message}", Toast.LENGTH_LONG).show()
-            return
+                } ?: 0L
+            } catch (e: Exception) {
+                Toast.makeText(context, "فشل نسخ الملف: ${e.message}", Toast.LENGTH_LONG).show()
+                return
+            }
+
+            if (bytesCopied < 1024) {
+                shareFile.delete()
+                Toast.makeText(context, "الملف فارغ أو تالف ($bytesCopied bytes) - حاول تحميل الفيديو مرة أخرى", Toast.LENGTH_LONG).show()
+                return
+            }
         }
 
-        // Step 3: Verify the copied file has actual video content
-        if (bytesCopied < 1024 || !destFile.exists() || destFile.length() < 1024) {
-            destFile.delete()
-            Toast.makeText(context, "الملف فارغ أو تالف (${bytesCopied} bytes) - حاول تحميل الفيديو مرة أخرى", Toast.LENGTH_LONG).show()
-            return
-        }
-
-        // Step 4: Create FileProvider URI
+        // Step 2: Create FileProvider URI from the local file
         val shareUri = androidx.core.content.FileProvider.getUriForFile(
             context,
             "${context.packageName}.provider",
-            destFile
+            shareFile
         )
 
-        // Step 5: Share to WhatsApp (or general share as fallback)
+        // Step 3: Share to WhatsApp (or general share as fallback)
         try {
             val shareIntent = Intent(Intent.ACTION_SEND).apply {
                 type = "video/mp4"

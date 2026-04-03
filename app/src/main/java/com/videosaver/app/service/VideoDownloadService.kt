@@ -185,23 +185,100 @@ class VideoDownloadService : Service() {
 
                 repository.updateStatus(downloadId, DownloadStatus.SAVING, 50)
 
-                // Save to Gallery
-                val savedPath = try {
-                    saveToGallery(fileName, body.byteStream(), totalBytes) { progress ->
-                        scope.launch {
-                            try {
-                                repository.updateStatus(downloadId, DownloadStatus.DOWNLOADING, progress)
-                                updateNotification(currentNotifId, "جاري التحميل... $progress%", progress)
-                            } catch (_: Exception) {
-                                // Ignore notification update failures
+                // Step 1: Download to a temporary file first (guaranteed writable)
+                val tempDir = File(applicationContext.cacheDir, "downloads")
+                if (!tempDir.exists()) tempDir.mkdirs()
+                val tempFile = File(tempDir, fileName)
+
+                val downloadedBytes = try {
+                    FileOutputStream(tempFile).use { output ->
+                        val buffer = ByteArray(8192)
+                        var bytesRead: Int
+                        var totalRead = 0L
+                        val inputStream = body.byteStream()
+
+                        while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                            output.write(buffer, 0, bytesRead)
+                            totalRead += bytesRead
+                            if (totalBytes > 0) {
+                                val progress = ((totalRead * 100) / totalBytes).toInt().coerceIn(0, 100)
+                                scope.launch {
+                                    try {
+                                        repository.updateStatus(downloadId, DownloadStatus.DOWNLOADING, progress)
+                                        updateNotification(currentNotifId, "جاري التحميل... $progress%", progress)
+                                    } catch (_: Exception) {}
+                                }
                             }
                         }
+                        output.flush()
+                        output.fd.sync()
+                        totalRead
                     }
+                } catch (e: Exception) {
+                    tempFile.delete()
+                    repository.updateError(downloadId, "فشل في تحميل الملف: ${e.message}")
+                    stopSelf()
+                    return@launch
+                }
+
+                // Step 2: Verify temp file is a valid video (check size + MP4 magic bytes)
+                if (!tempFile.exists() || tempFile.length() < 1024 || downloadedBytes < 1024) {
+                    tempFile.delete()
+                    repository.updateError(downloadId, "الملف المحمّل فارغ أو تالف ($downloadedBytes bytes)")
+                    stopSelf()
+                    return@launch
+                }
+
+                // Check MP4 magic bytes (ftyp atom at offset 4-7)
+                val isValidMp4 = try {
+                    tempFile.inputStream().use { input ->
+                        val header = ByteArray(12)
+                        val read = input.read(header)
+                        read >= 8 && (
+                            // Standard MP4: bytes 4-7 = "ftyp"
+                            (header[4] == 0x66.toByte() && header[5] == 0x74.toByte() &&
+                             header[6] == 0x79.toByte() && header[7] == 0x70.toByte()) ||
+                            // Some videos start with moov or mdat atoms
+                            (header[4] == 0x6D.toByte() && header[5] == 0x6F.toByte()) ||
+                            (header[4] == 0x6D.toByte() && header[5] == 0x64.toByte()) ||
+                            // WebM: starts with 0x1A45DFA3
+                            (header[0] == 0x1A.toByte() && header[1] == 0x45.toByte())
+                        )
+                    }
+                } catch (_: Exception) { false }
+
+                if (!isValidMp4) {
+                    // Log first bytes for debugging
+                    val firstBytes = try {
+                        tempFile.inputStream().use { it.readNBytes(8).joinToString("") { b -> "%02x".format(b) } }
+                    } catch (_: Exception) { "unknown" }
+                    tempFile.delete()
+                    repository.updateError(downloadId, "الملف ليس فيديو صالح (magic: $firstBytes)")
+                    stopSelf()
+                    return@launch
+                }
+
+                // Step 3: Copy verified temp file to gallery (MediaStore or legacy)
+                val savedPath = try {
+                    saveToGallery(fileName, tempFile.inputStream(), tempFile.length()) { _ -> }
                 } catch (e: Exception) {
                     repository.updateError(downloadId, "فشل في حفظ الملف: ${e.message}")
                     stopSelf()
                     return@launch
                 }
+
+                // Step 4: Also save a copy in app's external files for reliable sharing
+                try {
+                    val shareDir = File(applicationContext.getExternalFilesDir(null), "videos")
+                    if (!shareDir.exists()) shareDir.mkdirs()
+                    val shareFile = File(shareDir, fileName)
+                    tempFile.copyTo(shareFile, overwrite = true)
+                } catch (_: Exception) {
+                    // Non-critical - sharing will fall back to MediaStore URI
+                }
+
+                // Clean up temp file
+                tempFile.delete()
 
                 if (savedPath != null) {
                     repository.updateCompleted(downloadId, savedPath)
