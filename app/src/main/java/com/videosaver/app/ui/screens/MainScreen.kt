@@ -803,36 +803,26 @@ fun DeveloperCredits() {
                 contentScale = ContentScale.Crop
             )
 
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(14.dp))
 
-            // Developer name with gradient animation
+            // Description with animated developer name
             Text(
-                text = "Ali",
-                fontSize = 22.sp,
-                fontWeight = FontWeight.Bold,
-                style = MaterialTheme.typography.headlineSmall.copy(
-                    brush = Brush.linearGradient(listOf(color1, color2))
-                )
-            )
-
-            Spacer(modifier = Modifier.height(4.dp))
-
-            // Role
-            Text(
-                text = "مطور تطبيقات Android",
+                text = buildAnnotatedString {
+                    append("تم تصميم و برمجة هذا التطبيق بواسطة ")
+                    withStyle(
+                        SpanStyle(
+                            brush = Brush.linearGradient(listOf(color1, color2)),
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 18.sp
+                        )
+                    ) {
+                        append("Ali")
+                    }
+                },
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
                 fontWeight = FontWeight.Medium
-            )
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            // Description
-            Text(
-                text = "تم برمجة وتطوير هذا التطبيق بكل حب واهتمام",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                textAlign = TextAlign.Center
             )
 
         }
