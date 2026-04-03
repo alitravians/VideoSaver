@@ -98,7 +98,8 @@ class VideoDownloadService : Service() {
 
                 // Add platform-specific headers
                 val isCobaltStream = videoUrl.contains("stuff.solutions/api/stream")
-                val isTikWmCdn = videoUrl.contains("tiktokcdn") && !isCobaltStream
+                val isTikWmUrl = videoUrl.contains("tikwm.com")
+                val isTikWmCdn = (videoUrl.contains("tiktokcdn") || isTikWmUrl) && !isCobaltStream
                 when (platform) {
                     Platform.INSTAGRAM -> {
                         requestBuilder.header("Referer", "https://www.instagram.com/")
@@ -107,8 +108,11 @@ class VideoDownloadService : Service() {
                         if (isCobaltStream) {
                             // Cobalt stream proxy - minimal headers
                             requestBuilder.header("Accept", "*/*")
+                        } else if (isTikWmUrl) {
+                            // tikwm.com proxy URLs - minimal headers, no TikTok referer
+                            requestBuilder.header("Accept", "*/*")
                         } else if (isTikWmCdn) {
-                            // Direct TikTok CDN URLs from tikwm - no special headers needed
+                            // Direct TikTok CDN URLs - no special headers needed
                             requestBuilder.header("Accept", "*/*")
                             requestBuilder.header("Accept-Encoding", "identity")
                         } else {
@@ -156,6 +160,15 @@ class VideoDownloadService : Service() {
                 val body = response.body
                 if (body == null) {
                     repository.updateError(downloadId, "لم يتم العثور على الملف")
+                    stopSelf()
+                    return@launch
+                }
+
+                val contentType = response.header("Content-Type", "") ?: ""
+                // Reject HTML responses (error pages, not actual video)
+                if (contentType.contains("text/html") || contentType.contains("application/json")) {
+                    body.close()
+                    repository.updateError(downloadId, "الخادم لم يرجع ملف فيديو صالح")
                     stopSelf()
                     return@launch
                 }
@@ -239,10 +252,15 @@ class VideoDownloadService : Service() {
             ?: return null
 
         return try {
-            contentResolver.openOutputStream(uri)?.use { output ->
+            val outputStream = contentResolver.openOutputStream(uri)
+            if (outputStream == null) {
+                contentResolver.delete(uri, null, null)
+                return null
+            }
+            var totalRead = 0L
+            outputStream.use { output ->
                 val buffer = ByteArray(8192)
                 var bytesRead: Int
-                var totalRead = 0L
 
                 while (inputStream.read(buffer).also { bytesRead = it } != -1) {
                     output.write(buffer, 0, bytesRead)
@@ -252,6 +270,12 @@ class VideoDownloadService : Service() {
                         onProgress(progress)
                     }
                 }
+            }
+
+            // Verify file is not empty
+            if (totalRead == 0L) {
+                contentResolver.delete(uri, null, null)
+                return null
             }
 
             values.clear()
