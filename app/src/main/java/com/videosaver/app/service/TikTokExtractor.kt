@@ -39,7 +39,9 @@ class TikTokExtractor : VideoExtractor {
             val cleanedUrl = cleanTikTokUrl(url)
 
             // Step 1: Try tikwm.com API FIRST (most reliable, returns thumbnails + working CDN URLs)
-            var videoInfo = tryTikWmApi(cleanedUrl)
+            // Returns Pair(videoInfo, isSlideshow) - isSlideshow true if post is photos not video
+            val (tikwmResult, isSlideshow) = tryTikWmApi(cleanedUrl)
+            var videoInfo = tikwmResult
 
             // Step 2: If tikwm failed, try cobalt API + verify stream URL
             if (videoInfo == null) {
@@ -64,6 +66,8 @@ class TikTokExtractor : VideoExtractor {
 
             if (videoInfo != null) {
                 Result.success(videoInfo)
+            } else if (isSlideshow) {
+                Result.failure(Exception("هذا المنشور عبارة عن صور وليس فيديو - لا يمكن تحميله كفيديو"))
             } else {
                 Result.failure(Exception("تعذر استخراج الفيديو من TikTok. تأكد أن الرابط صحيح."))
             }
@@ -189,9 +193,9 @@ class TikTokExtractor : VideoExtractor {
 
     /**
      * Try tikwm.com API - reliable free TikTok video extraction.
-     * Returns direct TikTok CDN URLs that work for downloading.
+     * Returns Pair(VideoInfo?, isSlideshow) - isSlideshow true if post is photos not video.
      */
-    private fun tryTikWmApi(url: String): VideoInfo? {
+    private fun tryTikWmApi(url: String): Pair<VideoInfo?, Boolean> {
         return try {
             val requestBody = "url=${java.net.URLEncoder.encode(url, "UTF-8")}&hd=1"
                 .toRequestBody("application/x-www-form-urlencoded".toMediaType())
@@ -204,14 +208,27 @@ class TikTokExtractor : VideoExtractor {
                 .build()
 
             val response = client.newCall(request).execute()
-            if (!response.isSuccessful) return null
+            if (!response.isSuccessful) return Pair(null, false)
 
-            val body = response.body?.string() ?: return null
+            val body = response.body?.string() ?: return Pair(null, false)
             val json = JSONObject(body)
 
-            if (json.optInt("code", -1) != 0) return null
+            if (json.optInt("code", -1) != 0) return Pair(null, false)
 
-            val data = json.optJSONObject("data") ?: return null
+            val data = json.optJSONObject("data") ?: return Pair(null, false)
+
+            // Detect photo/slideshow posts (duration=0, size=0, images present)
+            // tikwm returns background music audio as "play" URL for these, not video
+            val duration = data.optInt("duration", 0)
+            val size = data.optInt("size", 0)
+            val hdSize = data.optInt("hd_size", 0)
+            val images = data.optJSONArray("images")
+            val hasImages = images != null && images.length() > 0
+
+            if (duration == 0 && size == 0 && hdSize == 0 && hasImages) {
+                // This is a photo/slideshow post, not a video
+                return Pair(null, true)
+            }
 
             // Prefer HD, then no-watermark play, then watermark play
             var videoUrl = data.optString("hdplay", "").ifEmpty {
@@ -220,7 +237,7 @@ class TikTokExtractor : VideoExtractor {
                 }
             }
 
-            if (videoUrl.isEmpty()) return null
+            if (videoUrl.isEmpty()) return Pair(null, false)
 
             // Ensure full URL (tikwm sometimes returns relative paths)
             if (!videoUrl.startsWith("http")) {
@@ -240,25 +257,26 @@ class TikTokExtractor : VideoExtractor {
             verifyResponse.close()
 
             // If verification fails or returns HTML/text, skip
-            if (verifyCode !in 200..299 && verifyCode != 206) return null
-            if (verifyContentType.contains("text/html") || verifyContentType.contains("text/plain")) return null
+            if (verifyCode !in 200..299 && verifyCode != 206) return Pair(null, false)
+            if (verifyContentType.contains("text/html") || verifyContentType.contains("text/plain")) return Pair(null, false)
+            // Reject audio-only responses (tikwm sometimes returns music URL as video)
+            if (verifyContentType.contains("audio/mpeg") || verifyContentType.contains("audio/mp3")) return Pair(null, false)
 
             val thumbnailUrl = data.optString("cover", "").ifEmpty {
                 data.optString("origin_cover", "")
             }
-            val duration = data.optInt("duration", 0)
             val title = data.optString("title", "")
 
-            VideoInfo(
+            Pair(VideoInfo(
                 videoUrl = videoUrl,
                 thumbnailUrl = thumbnailUrl,
                 title = title,
                 platform = Platform.TIKTOK,
                 contentType = ContentType.VIDEO,
                 duration = if (duration > 0) formatDuration(duration) else ""
-            )
+            ), false)
         } catch (_: Exception) {
-            null
+            Pair(null, false)
         }
     }
 

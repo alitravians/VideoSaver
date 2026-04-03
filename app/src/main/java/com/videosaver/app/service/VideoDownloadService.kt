@@ -161,8 +161,9 @@ class VideoDownloadService : Service() {
                 }
 
                 val contentType = response.header("Content-Type", "") ?: ""
-                // Reject non-video responses (error pages, text errors, JSON errors)
-                if (contentType.contains("text/") || contentType.contains("application/json")) {
+                // Reject non-video responses (error pages, text errors, JSON errors, audio-only)
+                if (contentType.contains("text/") || contentType.contains("application/json") ||
+                    contentType.contains("audio/mpeg") || contentType.contains("audio/mp3")) {
                     body.close()
                     repository.updateError(downloadId, "الخادم لم يرجع ملف فيديو صالح")
                     stopSelf()
