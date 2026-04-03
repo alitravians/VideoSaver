@@ -4,6 +4,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColor
 import androidx.compose.animation.animateContentSize
@@ -499,40 +500,7 @@ fun MainScreen(
                                 // WhatsApp Share Button
                                 Button(
                                     onClick = {
-                                        try {
-                                            val filePath = uiState.lastDownloadedFilePath
-                                            if (filePath.isNotEmpty()) {
-                                                // Always copy to cache and share via FileProvider for maximum compatibility
-                                                val shareUri = copyToShareCache(context, filePath)
-                                                if (shareUri != null) {
-                                                    val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                                                        type = "video/mp4"
-                                                        putExtra(Intent.EXTRA_STREAM, shareUri)
-                                                        clipData = android.content.ClipData.newRawUri("", shareUri)
-                                                        setPackage("com.whatsapp")
-                                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                                    }
-                                                    context.startActivity(shareIntent)
-                                                }
-                                            }
-                                        } catch (_: Exception) {
-                                            // If WhatsApp not installed, use general share
-                                            try {
-                                                val filePath = uiState.lastDownloadedFilePath
-                                                if (filePath.isNotEmpty()) {
-                                                    val shareUri = copyToShareCache(context, filePath)
-                                                    if (shareUri != null) {
-                                                        val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                                                            type = "video/mp4"
-                                                            putExtra(Intent.EXTRA_STREAM, shareUri)
-                                                            clipData = android.content.ClipData.newRawUri("", shareUri)
-                                                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                                        }
-                                                        context.startActivity(Intent.createChooser(shareIntent, "مشاركة الفيديو"))
-                                                    }
-                                                }
-                                            } catch (_: Exception) { }
-                                        }
+                                        shareVideoToWhatsApp(context, uiState.lastDownloadedFilePath)
                                     },
                                     colors = ButtonDefaults.buttonColors(
                                         containerColor = SuccessGreen
@@ -637,44 +605,83 @@ fun MainScreen(
 }
 
 /**
- * Copy video from MediaStore content URI or file path to cache directory,
- * then return a FileProvider URI for reliable sharing with WhatsApp and other apps.
+ * Share video to WhatsApp with robust error handling.
+ * For content:// URIs (MediaStore, Android 10+), shares directly.
+ * For file paths, copies to cache and uses FileProvider.
+ * Shows Toast messages for any errors.
  */
-private fun copyToShareCache(context: Context, filePath: String): Uri? {
-    return try {
-        val cacheDir = java.io.File(context.cacheDir, "share")
-        if (!cacheDir.exists()) cacheDir.mkdirs()
+private fun shareVideoToWhatsApp(context: Context, filePath: String) {
+    if (filePath.isEmpty()) {
+        Toast.makeText(context, "لم يتم العثور على الملف", Toast.LENGTH_SHORT).show()
+        return
+    }
 
-        // Clean old cached files
-        cacheDir.listFiles()?.forEach { it.delete() }
+    try {
+        val shareUri: Uri
+        val needsGrantPermission: Boolean
 
-        val destFile = java.io.File(cacheDir, "video_${System.currentTimeMillis()}.mp4")
-
-        val sourceUri = if (filePath.startsWith("content://")) {
-            Uri.parse(filePath)
-        } else {
-            Uri.fromFile(java.io.File(filePath))
-        }
-
-        context.contentResolver.openInputStream(sourceUri)?.use { input ->
-            java.io.FileOutputStream(destFile).use { output ->
-                input.copyTo(output)
+        if (filePath.startsWith("content://")) {
+            // MediaStore content URI (Android 10+) - can be shared directly
+            val contentUri = Uri.parse(filePath)
+            // Verify the file has actual content before sharing
+            val fileSize = try {
+                context.contentResolver.openAssetFileDescriptor(contentUri, "r")?.use { it.length } ?: 0L
+            } catch (_: Exception) { 0L }
+            if (fileSize < 1024) {
+                Toast.makeText(context, "الملف فارغ أو تالف - حاول تحميل الفيديو مرة أخرى", Toast.LENGTH_LONG).show()
+                return
             }
-        } ?: return null
-
-        // Verify copied file is not empty
-        if (destFile.length() == 0L) {
-            destFile.delete()
-            return null
+            shareUri = contentUri
+            needsGrantPermission = true
+        } else {
+            // File path - verify file exists and is valid, then use FileProvider
+            val file = java.io.File(filePath)
+            if (!file.exists()) {
+                Toast.makeText(context, "الملف غير موجود", Toast.LENGTH_SHORT).show()
+                return
+            }
+            if (file.length() < 1024) {
+                Toast.makeText(context, "الملف فارغ أو تالف", Toast.LENGTH_SHORT).show()
+                return
+            }
+            shareUri = androidx.core.content.FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.provider",
+                file
+            )
+            needsGrantPermission = true
         }
 
-        androidx.core.content.FileProvider.getUriForFile(
-            context,
-            "${context.packageName}.provider",
-            destFile
-        )
-    } catch (_: Exception) {
-        null
+        // Try WhatsApp first
+        try {
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "video/*"
+                putExtra(Intent.EXTRA_STREAM, shareUri)
+                clipData = android.content.ClipData.newRawUri("", shareUri)
+                setPackage("com.whatsapp")
+                if (needsGrantPermission) {
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+            }
+            context.startActivity(shareIntent)
+        } catch (_: Exception) {
+            // WhatsApp not installed or failed - try general share
+            try {
+                val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                    type = "video/*"
+                    putExtra(Intent.EXTRA_STREAM, shareUri)
+                    clipData = android.content.ClipData.newRawUri("", shareUri)
+                    if (needsGrantPermission) {
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                }
+                context.startActivity(Intent.createChooser(shareIntent, "مشاركة الفيديو"))
+            } catch (_: Exception) {
+                Toast.makeText(context, "فشل مشاركة الفيديو", Toast.LENGTH_SHORT).show()
+            }
+        }
+    } catch (e: Exception) {
+        Toast.makeText(context, "خطأ في مشاركة الفيديو: ${e.message}", Toast.LENGTH_SHORT).show()
     }
 }
 
