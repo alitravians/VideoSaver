@@ -25,9 +25,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import android.os.Handler
-import android.os.Looper
-import android.widget.Toast
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -240,8 +237,6 @@ class VideoDownloadService : Service() {
                     }
                 } catch (_: Exception) { ByteArray(12) }
 
-                val headerHex = headerBytes.joinToString("") { "%02x".format(it) }
-
                 // First: explicitly reject image files (JPEG, PNG, GIF, WebP)
                 val isImage = headerBytes.size >= 3 && (
                     // JPEG: FFD8FF
@@ -256,7 +251,7 @@ class VideoDownloadService : Service() {
 
                 if (isImage) {
                     tempFile.delete()
-                    repository.updateError(downloadId, "الخادم رجع صورة بدل فيديو - حاول مرة أخرى (header: $headerHex)")
+                    repository.updateError(downloadId, "الخادم رجع صورة بدل فيديو - حاول مرة أخرى")
                     stopSelf()
                     return@launch
                 }
@@ -285,20 +280,11 @@ class VideoDownloadService : Service() {
                     val isTextContent = headerBytes[0] == '<'.code.toByte() || headerBytes[0] == '{'.code.toByte() || headerBytes[0] == 'H'.code.toByte()
                     if (isTextContent || tempFile.length() < 10 * 1024) {
                         tempFile.delete()
-                        repository.updateError(downloadId, "الملف ليس فيديو صالح (header: $headerHex)")
+                        repository.updateError(downloadId, "الملف ليس فيديو صالح")
                         stopSelf()
                         return@launch
                     }
                 }
-
-                // Read temp file header for verification later
-                val tempHeader = try {
-                    tempFile.inputStream().use { s ->
-                        val h = ByteArray(8)
-                        s.read(h)
-                        h
-                    }
-                } catch (_: Exception) { ByteArray(8) }
 
                 // Step 3: Save a copy in app's external files for reliable sharing
                 var shareFilePath: String? = null
@@ -332,19 +318,13 @@ class VideoDownloadService : Service() {
                 if (savedPath != null) {
                     repository.updateCompleted(downloadId, savedPath)
 
-                    // Show diagnostic Toast with file details
-                    val diagMsg = "تم الحفظ: ${downloadedBytes / 1024}KB | header: ${tempHeader.take(4).joinToString("") { "%02x".format(it) }}"
-                    Handler(Looper.getMainLooper()).post {
-                        Toast.makeText(applicationContext, diagMsg, Toast.LENGTH_LONG).show()
-                    }
-
                     try {
                         showCompletionNotification(currentNotifId, fileName)
                     } catch (_: Exception) {
                         // Ignore notification failures
                     }
                 } else {
-                    repository.updateError(downloadId, "فشل في حفظ الملف في المعرض (temp: ${downloadedBytes}B)")
+                    repository.updateError(downloadId, "فشل في حفظ الملف في المعرض")
                 }
 
             } catch (e: Exception) {
